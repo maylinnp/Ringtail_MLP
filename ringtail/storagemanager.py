@@ -66,6 +66,7 @@ class StorageManager:
 
         storage_types = {
             "sqlite": StorageManagerSQLite,
+            "sqlalchemy": StorageManagerSQLAlchemy,
         }
         if storage_type in storage_types:
             return storage_types[storage_type]
@@ -611,6 +612,7 @@ class StorageManagerSQLite(StorageManager):
         """
         ligand_name = ligand_dict["ligname"]
         ligand_smile = ligand_dict["ligand_smile_string"]
+        ligand_rdjson = Chem.MolToJSON(Chem.MolFromSmiles(ligand_smile))
         ligand_index_map = json.dumps(ligand_dict["ligand_index_map"])
         ligand_h_parents = json.dumps(ligand_dict["ligand_h_parents"])
         input_model = json.dumps(ligand_dict["ligand_input_model"])
@@ -618,6 +620,7 @@ class StorageManagerSQLite(StorageManager):
         return [
             ligand_name,
             ligand_smile,
+            ligand_rdjson,
             ligand_index_map,
             ligand_h_parents,
             input_model,
@@ -643,12 +646,7 @@ class StorageManagerSQLite(StorageManager):
         hydrogen_parents,
         input_model
         ) VALUES
-        (?,?,mol_from_smiles(?),?,?,?)"""
-
-        ## repeat smiles in the third position of ligand array, to create rdmol
-        for ligand_entry in ligand_array:
-            smiles = ligand_entry[1]
-            ligand_entry.insert(2, smiles)
+        (?,?,?,?,?,?)"""
 
         try:
             cur = self.conn.cursor()
@@ -3650,3 +3648,49 @@ class StorageManagerSQLite(StorageManager):
         return cur
 
     # endregion
+
+
+class StorageManagerSQLAlchemy(StorageManager):
+    pass
+"""
+    import sqlalchemy
+    from typing import List
+    from typing import Optional
+    from sqlalchemy import ForeignKey
+    from sqlalchemy import String
+    from sqlalchemy.orm import DeclarativeBase
+    from sqlalchemy.orm import Mapped
+    from sqlalchemy.orm import mapped_column
+    from sqlalchemy.orm import relationship
+
+    def __init__(self, db_file: str | None = None):
+        print("Initialized the SQL Alchemy class!")
+        print(f"My database file is this >>> {db_file}")
+        
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Result(Base):
+        __tablename__ = "results"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str] = mapped_column(String(30))
+        fullname: Mapped[Optional[str]]
+        addresses: Mapped[List["Address"]] = relationship(
+            back_populates="user", cascade="all, delete-orphan"
+        )
+
+        def __repr__(self) -> str:
+            return f"User(id={self.id!r}, name={self.name!r}, fullname={self.fullname!r})"
+
+    class Interaction(Base):
+        __tablename__ = "interactions"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        email_address: Mapped[str]
+        user_id: Mapped[int] = mapped_column(ForeignKey("user_account.id"))
+        user: Mapped["User"] = relationship(back_populates="addresses")
+
+        def __repr__(self) -> str:
+            return f"Address(id={self.id!r}, email_address={self.email_address!r})"
+        
+"""
