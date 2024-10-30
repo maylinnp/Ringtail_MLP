@@ -584,7 +584,7 @@ class StorageManagerSQLite(StorageManager):
         ligand_table = """CREATE TABLE IF NOT EXISTS Ligands (
             LigName             VARCHAR NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
             ligand_smile        VARCHAR[],
-            ligand_rdmol        MOL,
+            ligand_rdmol        VARCHAR[],
             atom_index_map      VARCHAR[],
             hydrogen_parents    VARCHAR[],
             input_model         VARCHAR[])"""
@@ -616,7 +616,10 @@ class StorageManagerSQLite(StorageManager):
         ligand_index_map = json.dumps(ligand_dict["ligand_index_map"])
         ligand_h_parents = json.dumps(ligand_dict["ligand_h_parents"])
         input_model = json.dumps(ligand_dict["ligand_input_model"])
-
+        mol = Chem.MolFromSmiles(ligand_smile)
+        print(" the mol", mol)
+        print(" Number of heavy atoms: ", mol.GetNumAtoms(onlyExplicit = True))
+        print(" Number of atoms: ", mol.GetNumAtoms(onlyExplicit = False))
         return [
             ligand_name,
             ligand_smile,
@@ -647,7 +650,8 @@ class StorageManagerSQLite(StorageManager):
         input_model
         ) VALUES
         (?,?,?,?,?,?)"""
-
+        with open("mol.json", 'w') as f:
+            json.dump(json.loads(ligand_array[0][2]), f, indent=4)
         try:
             cur = self.conn.cursor()
             cur.executemany(sql_insert, ligand_array)
@@ -1856,6 +1860,12 @@ class StorageManagerSQLite(StorageManager):
     # endregion
 
     # region Methods for getting information from database
+    def count_heavy_atoms(self, ligname):
+        # a simple test method to count heavy atoms of a ligand
+        query=f"""SELECT JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') FROM Ligands 
+        WHERE LigName = {ligname}"""
+        return self._run_query(query).fetchone()
+
     def fetch_receptor_object_by_name(self, rec_name):
         """Returns Receptor object from database for given rec_name
 
@@ -3170,6 +3180,8 @@ class StorageManagerSQLite(StorageManager):
                     name_sql_str = " L.LigName LIKE '%{value}%' OR".format(value=name)
                     sql_ligand_string += name_sql_str
             if kw == "ligand_max_atoms" and ligand_filters[kw] is not None:
+                #TODO must replace function here, mol num hvyatms
+                #rdkit function is: mol.getNumAtoms(True), the True must signify to not include Hs
                 maxatom_sql_str = " mol_num_hvyatms(ligand_rdmol) <= {} {}".format(
                     ligand_filters[kw], logical_operator
                 )
@@ -3183,6 +3195,7 @@ class StorageManagerSQLite(StorageManager):
                             raise DatabaseQueryError(
                                 f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
                             )
+                    #TODO replace chemicalite cartridge formula here
                     substruct_sql_str = " mol_is_substruct(ligand_rdmol, mol_from_smarts('{smarts}')) {logical_operator}".format(
                         smarts=smarts, logical_operator=logical_operator
                     )
