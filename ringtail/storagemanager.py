@@ -170,17 +170,17 @@ class StorageManager:
             receptor_array (list): list of data to be stored in Receptors table
             insert_receptor (bool, optional): flag indicating that receptor info should inserted
         """
-        Pose_IDs, duplicates = self._insert_results(results_array)
+        # Pose_IDs, duplicates = self._insert_results(results_array)
         self._insert_ligands(ligands_array)
-        if insert_receptor and receptor_array != []:
-            # first checks if there is receptor info already in the db
-            receptors = self.fetch_receptor_objects()
-            # insert receptor if database does not have already have a receptor entry
-            if len(receptors) == 0:
-                self._insert_receptors(receptor_array)
-        # insert interactions if they are present
-        if interaction_list != []:
-            self.insert_interactions(Pose_IDs, interaction_list, duplicates)
+        # if insert_receptor and receptor_array != []:
+        #     # first checks if there is receptor info already in the db
+        #     receptors = self.fetch_receptor_objects()
+        #     # insert receptor if database does not have already have a receptor entry
+        #     if len(receptors) == 0:
+        #         self._insert_receptors(receptor_array)
+        # # insert interactions if they are present
+        # if interaction_list != []:
+        #     self.insert_interactions(Pose_IDs, interaction_list, duplicates)
 
     def insert_interactions(self, Pose_IDs: list, interactions_list, duplicates):
         """Takes list of interactions, inserts into database
@@ -616,10 +616,7 @@ class StorageManagerSQLite(StorageManager):
         ligand_index_map = json.dumps(ligand_dict["ligand_index_map"])
         ligand_h_parents = json.dumps(ligand_dict["ligand_h_parents"])
         input_model = json.dumps(ligand_dict["ligand_input_model"])
-        mol = Chem.MolFromSmiles(ligand_smile)
-        print(" the mol", mol)
-        print(" Number of heavy atoms: ", mol.GetNumAtoms(onlyExplicit = True))
-        print(" Number of atoms: ", mol.GetNumAtoms(onlyExplicit = False))
+
         return [
             ligand_name,
             ligand_smile,
@@ -650,7 +647,7 @@ class StorageManagerSQLite(StorageManager):
         input_model
         ) VALUES
         (?,?,?,?,?,?)"""
-        with open("mol.json", 'w') as f:
+        with open("mol.json", "w") as f:
             json.dump(json.loads(ligand_array[0][2]), f, indent=4)
         try:
             cur = self.conn.cursor()
@@ -1862,7 +1859,7 @@ class StorageManagerSQLite(StorageManager):
     # region Methods for getting information from database
     def count_heavy_atoms(self, ligname):
         # a simple test method to count heavy atoms of a ligand
-        query=f"""SELECT JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') FROM Ligands 
+        query = f"""SELECT JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') FROM Ligands 
         WHERE LigName = {ligname}"""
         return self._run_query(query).fetchone()
 
@@ -3180,8 +3177,8 @@ class StorageManagerSQLite(StorageManager):
                     name_sql_str = " L.LigName LIKE '%{value}%' OR".format(value=name)
                     sql_ligand_string += name_sql_str
             if kw == "ligand_max_atoms" and ligand_filters[kw] is not None:
-                #TODO must replace function here, mol num hvyatms
-                #rdkit function is: mol.getNumAtoms(True), the True must signify to not include Hs
+                # TODO must replace function here, mol num hvyatms
+                # rdkit function is: mol.getNumAtoms(True), the True must signify to not include Hs
                 maxatom_sql_str = " mol_num_hvyatms(ligand_rdmol) <= {} {}".format(
                     ligand_filters[kw], logical_operator
                 )
@@ -3195,7 +3192,7 @@ class StorageManagerSQLite(StorageManager):
                             raise DatabaseQueryError(
                                 f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
                             )
-                    #TODO replace chemicalite cartridge formula here
+                    # TODO replace chemicalite cartridge formula here
                     substruct_sql_str = " mol_is_substruct(ligand_rdmol, mol_from_smarts('{smarts}')) {logical_operator}".format(
                         smarts=smarts, logical_operator=logical_operator
                     )
@@ -3206,6 +3203,52 @@ class StorageManagerSQLite(StorageManager):
             sql_ligand_string = sql_ligand_string.rstrip("OR")
 
         return sql_ligand_string
+
+    def stream_ligand_substruct(self, batch_size):
+        numbers_processed = 0
+        passing_ligands = []
+
+        # generator of cursor stream
+        def _stream_query(query: str, batch_size: int = 1):
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+
+            while True:
+                batch = cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                for row in batch:
+                    yield row
+
+        # query looks for double bonds to oxygen, a start. Hopefully most SMARTS patterns can be generalized somewhat?
+        for row in _stream_query(
+            "SELECT Ligname, ligand_smile FROM Ligands WHERE ligand_smile LIKE '%O%'",
+            batch_size,
+        ):
+
+            # search for ketones in the reduced dataset
+            smarts1 = "C=O"
+            smartsmol1 = Chem.MolFromSmarts(smarts1)
+            smiles = row[1]
+            ligandmol = Chem.MolFromSmiles(smiles)
+            is_substruct1 = bool(ligandmol.GetSubstructMatch(smartsmol1))
+
+            smarts2 = "[Oh]C"
+            smartsmol2 = Chem.MolFromSmarts(smarts2)
+            is_substruct2 = bool(ligandmol.GetSubstructMatch(smartsmol2))
+
+            if bool(is_substruct1 and is_substruct2):
+                passing_ligands.append(row[0])
+            numbers_processed += 1
+        print("Number of ligands passing filter: ", len(passing_ligands))
+
+    def rdkit_ligand_substruct(self):
+        smarts1 = "C=O"
+        smarts2 = "[Oh]C"
+        query = f"""SELECT LigName FROM Ligands L WHERE mol_is_substruct(mol_from_smiles(L.ligand_smile), mol_from_smarts('{smarts1}')) AND mol_is_substruct(mol_from_smiles(L.ligand_smile), mol_from_smarts('{smarts2}'))"""
+
+        cursor = self._run_query(query)
+        print("Number of ligands passing filter: ", len(cursor.fetchall()))
 
     def _generate_selective_insert_query(
         self, bookmark1_name, bookmark2_name, select_str, new_db_name, temp_table
@@ -3665,6 +3708,8 @@ class StorageManagerSQLite(StorageManager):
 
 class StorageManagerSQLAlchemy(StorageManager):
     pass
+
+
 """
     import sqlalchemy
     from typing import List
