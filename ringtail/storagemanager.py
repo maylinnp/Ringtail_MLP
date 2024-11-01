@@ -2654,7 +2654,16 @@ class StorageManagerSQLite(StorageManager):
 
         # run the rdkit queries first
         if rdkit_query:
-            # run the unclustered_query,
+            # run the unclustered_query
+            ## can probably run it directly in the substruct method
+            # TODO my query does not have select statement, which I'll need
+            results = self._perform_ligand_substruct_filter(
+                unclustered_query, _lig_filters
+            )
+            substruct_ready_poseids = self._run_query(
+                f"SELECT R.LigName FROM {filtering_window} R WHERE " + unclustered_query
+            )
+
             # stream results into memory
             # run the substruct search
             # if substruct_pos requested
@@ -3176,17 +3185,17 @@ class StorageManagerSQLite(StorageManager):
 
         return self._run_query(sql_string).fetchall()
 
-    def _generate_ligand_filtering_query(self, ligand_filters: dict) -> str:
+    def _perform_ligand_substruct_filter(self, query: str, ligand_filters: dict) -> str:
         """write string to select from ligand table
 
         Args:
+            query (str): query string for simple filters
             ligand_filters (list): List of filters on ligand table
 
         Returns:
-            str: SQLite-formatted query
+            str: SQLite-formatted query where pose ids represents results passing substruct filters
         """
 
-        sql_ligand_string = "SELECT L.LigName FROM Ligands L WHERE"
         if "ligand_operator" in ligand_filters:
             logical_operator = ligand_filters["ligand_operator"]
         else:
@@ -3194,89 +3203,60 @@ class StorageManagerSQLite(StorageManager):
                 "A logical operator to combine ligand filters were not provided, will use the default value 'OR'."
             )
             logical_operator = "OR"
-        if logical_operator is None:
-            logical_operator = "AND"
-        for kw in ligand_filters.keys():
-            fils = ligand_filters[kw]
-            if kw == "ligand_name":
-                for name in fils:
-                    if name == "":
-                        continue
-                    name_sql_str = " L.LigName LIKE '%{value}%' OR".format(value=name)
-                    sql_ligand_string += name_sql_str
-            if kw == "ligand_max_atoms" and ligand_filters[kw] is not None:
-                # TODO must replace function here, mol num hvyatms
-                # rdkit function is: mol.getNumAtoms(True), the True must signify to not include Hs
-                maxatom_sql_str = " mol_num_hvyatms(ligand_rdmol) <= {} {}".format(
-                    ligand_filters[kw], logical_operator
-                )
-                sql_ligand_string += maxatom_sql_str
-            if kw == "ligand_substruct":
-                for smarts in fils:
-                    # check for hydrogens in smarts pattern
-                    smarts_mol = Chem.MolFromSmarts(smarts)
-                    for atom in smarts_mol.GetAtoms():
-                        if atom.GetAtomicNum() == 1:
-                            raise DatabaseQueryError(
-                                f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
-                            )
-                    # TODO replace chemicalite cartridge formula here
-                    substruct_sql_str = " mol_is_substruct(ligand_rdmol, mol_from_smarts('{smarts}')) {logical_operator}".format(
-                        smarts=smarts, logical_operator=logical_operator
-                    )
-                    sql_ligand_string += substruct_sql_str
-        if sql_ligand_string.endswith("AND"):
-            sql_ligand_string = sql_ligand_string.rstrip("AND")
-        if sql_ligand_string.endswith("OR"):
-            sql_ligand_string = sql_ligand_string.rstrip("OR")
 
-        return sql_ligand_string
+        # handle substruct
+        if "substruct" in ligand_filters:
+            # list of smarts converted to mol for filtering
+            smarts_mols = []
+            for smarts in ligand_filters["substruct"]:
+                smarts_mol = Chem.MolFromSmarts(smarts)
+                # make sure SMARTS is valid
+                for atom in smarts_mol.GetAtoms():
+                    if atom.GetAtomicNum() == 1:
+                        raise DatabaseQueryError(
+                            f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
+                        )
+                smarts_mols.append(smarts_mol)
 
-    def stream_ligand_substruct(self, batch_size):
-        numbers_processed = 0
-        passing_ligands = []
+            # my in memory query goes here
+            filtered_ligands_with_substructs = []
 
-        # generator of cursor stream
-        def _stream_query(query: str, batch_size: int = 1):
-            cursor = self.conn.cursor()
-            cursor.execute(query)
+            # generator of cursor stream
+            def _stream_query(query: str, batch_size: int = 100):
+                cursor = self.conn.cursor()
+                cursor.execute(query)
 
-            while True:
-                batch = cursor.fetchmany(batch_size)
-                if not batch:
-                    break
-                for row in batch:
-                    yield row
+                while True:
+                    batch = cursor.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    for row in batch:
+                        yield row
 
-        # query looks for double bonds to oxygen, a start. Hopefully most SMARTS patterns can be generalized somewhat?
-        for row in _stream_query(
-            "SELECT Ligname, ligand_smile FROM Ligands WHERE ligand_smile LIKE '%O%'",
-            batch_size,
-        ):
-
-            # search for ketones in the reduced dataset
-            smarts1 = "C=O"
-            smartsmol1 = Chem.MolFromSmarts(smarts1)
-            smiles = row[1]
-            ligandmol = Chem.MolFromSmiles(smiles)
-            is_substruct1 = bool(ligandmol.GetSubstructMatch(smartsmol1))
-
-            smarts2 = "[Oh]C"
-            smartsmol2 = Chem.MolFromSmarts(smarts2)
-            is_substruct2 = bool(ligandmol.GetSubstructMatch(smartsmol2))
-
-            if bool(is_substruct1 and is_substruct2):
-                passing_ligands.append(row[0])
-            numbers_processed += 1
-        print("Number of ligands passing filter: ", len(passing_ligands))
-
-    def rdkit_ligand_substruct(self):
-        smarts1 = "C=O"
-        smarts2 = "[Oh]C"
-        query = f"""SELECT LigName FROM Ligands L WHERE mol_is_substruct(mol_from_smiles(L.ligand_smile), mol_from_smarts('{smarts1}')) AND mol_is_substruct(mol_from_smiles(L.ligand_smile), mol_from_smarts('{smarts2}'))"""
-
-        cursor = self._run_query(query)
-        print("Number of ligands passing filter: ", len(cursor.fetchall()))
+            # the main unclustered query goes here, and should return ligand stuff by joining on ligand name of passing pose ids
+            for row in _stream_query(
+                f"SELECT LigName, ligand_rdmol FROM Ligands JOIN ({query}) res ON Ligands.LigName = res.LigName"
+            ):
+                # deserialize rdmol
+                ligand_mol = Chem.JSONToMol(row[1])
+                # count how many matches
+                SMARTS_match = 0
+                # check for each SMARTS if is substruct
+                for smarts_mol in smarts_mols:
+                    is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
+                    # if match
+                    if is_substruct:
+                        # if ligand substruct operator is OR, only one match is needed to qualify the ligand
+                        if logical_operator == "OR":
+                            filtered_ligands_with_substructs.append(row[0])
+                            # stop testing this ligand since it just needed one match to pass
+                            break
+                        # if logical operator is AND, accumulate each match
+                        else:
+                            SMARTS_match += 1
+                # if and operator, check if ligand matched on all smarts patterns
+                if logical_operator == "AND" and SMARTS_match == len(smarts_mols):
+                    filtered_ligands_with_substructs.append(row[0])
 
     def _generate_selective_insert_query(
         self, bookmark1_name, bookmark2_name, select_str, new_db_name, temp_table
