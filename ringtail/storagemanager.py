@@ -170,17 +170,17 @@ class StorageManager:
             receptor_array (list): list of data to be stored in Receptors table
             insert_receptor (bool, optional): flag indicating that receptor info should inserted
         """
-        # Pose_IDs, duplicates = self._insert_results(results_array)
+        Pose_IDs, duplicates = self._insert_results(results_array)
         self._insert_ligands(ligands_array)
-        # if insert_receptor and receptor_array != []:
-        #     # first checks if there is receptor info already in the db
-        #     receptors = self.fetch_receptor_objects()
-        #     # insert receptor if database does not have already have a receptor entry
-        #     if len(receptors) == 0:
-        #         self._insert_receptors(receptor_array)
-        # # insert interactions if they are present
-        # if interaction_list != []:
-        #     self.insert_interactions(Pose_IDs, interaction_list, duplicates)
+        if insert_receptor and receptor_array != []:
+            # first checks if there is receptor info already in the db
+            receptors = self.fetch_receptor_objects()
+            # insert receptor if database does not have already have a receptor entry
+            if len(receptors) == 0:
+                self._insert_receptors(receptor_array)
+        # insert interactions if they are present
+        if interaction_list != []:
+            self.insert_interactions(Pose_IDs, interaction_list, duplicates)
 
     def insert_interactions(self, Pose_IDs: list, interactions_list, duplicates):
         """Takes list of interactions, inserts into database
@@ -573,6 +573,7 @@ class StorageManagerSQLite(StorageManager):
         """Create table for ligands. Columns are:
         LigName             VARCHAR NOT NULL,
         ligand_smile        VARCHAR[],
+        ligand_rdmol        VARCHAR[],
         atom_index_map      VARCHAR[],
         hydrogen_parents    VARCHAR[],
         input_model         VARCHAR[]
@@ -647,8 +648,7 @@ class StorageManagerSQLite(StorageManager):
         input_model
         ) VALUES
         (?,?,?,?,?,?)"""
-        with open("mol.json", "w") as f:
-            json.dump(json.loads(ligand_array[0][2]), f, indent=4)
+
         try:
             cur = self.conn.cursor()
             cur.executemany(sql_insert, ligand_array)
@@ -1858,6 +1858,7 @@ class StorageManagerSQLite(StorageManager):
 
     # region Methods for getting information from database
     def count_heavy_atoms(self, ligname):
+        # TODO
         # a simple test method to count heavy atoms of a ligand
         query = f"""SELECT JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') FROM Ligands 
         WHERE LigName = {ligname}"""
@@ -2519,8 +2520,8 @@ class StorageManagerSQLite(StorageManager):
         num_query = ""
         int_query = ""
         lig_query = ""
-        ligand_substruct_queries = []
-        join_stmnt = ""
+        rdkit_query = []
+        substruct_join_stmnt = ""
 
         # if filtering over a bookmark (i.e., already filtered results) as opposed to a whole database
         if self.filter_bookmark is not None:
@@ -2594,29 +2595,45 @@ class StorageManagerSQLite(StorageManager):
                     )
             # check if ligand filters and prepare for query
             if "lig_filters" in processed_filters:
-                lig_filters = processed_filters["lig_filters"]
-                ligand_queries = []
-                if (
-                    "ligand_substruct" in lig_filters
-                    or "ligand_name" in lig_filters
-                    or "ligand_max_atoms" in lig_filters
-                ):
-                    ligand_queries.append(
-                        self._generate_ligand_filtering_query(lig_filters)
-                    )
-                # if complex ligand filter, generate partial query
-                if "ligand_substruct_pos" in lig_filters:
-                    for substruct_pos in lig_filters["ligand_substruct_pos"]:
-                        temp_lig_filter = lig_filters
-                        temp_lig_filter["ligand_substruct_pos"] = substruct_pos
-                        ligand_substruct_queries.append(
-                            self._ligand_substructure_position_filter(temp_lig_filter)
+                _lig_filters = processed_filters["lig_filters"]
+                _lig_queries = []
+                # join all non-rdkit ligand queries that are not empty
+                if "ligand_name" in _lig_filters:
+                    _ligname_query = ""
+                    for ligname in _lig_filters["ligand_name"]:
+                        if ligname == "":
+                            continue
+                        _ligname_query = (
+                            _ligname_query + " OR " + "L.LigName LIKE '%{ligname}%'"
                         )
-                    join_stmnt = " " + lig_filters["ligand_operator"] + " "
-                # join all ligand queries that are not empty
-                lig_query = " AND ".join(
-                    [lig_filter for lig_filter in ligand_queries if lig_filter]
-                )
+                    _lig_queries.append(_ligname_query)
+                if "ligand_max_atoms" in _lig_filters:
+                    _ligatom_query = ""
+                    for max_atoms in _lig_filters["ligand_max_atoms"]:
+                        if max_atoms == "":
+                            continue
+                        # TODO might throw an error if wrong type
+                        _ligatom_query = (
+                            _ligatom_query
+                            + " OR "
+                            + f" JSON_ARRAY_LENGTH(json(L.ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') = {max_atoms} "
+                        )
+                    _lig_queries.append(_ligatom_query)
+
+                lig_query = " AND ".join([query for query in _lig_queries if query])
+
+                # substruct queries need to be handled in memory separate from the main query
+                if (
+                    "ligand_substruct" in _lig_filters
+                    or "ligand_substruct_pos" in _lig_filters
+                ):
+                    rdkit_query["ligand_substruct"] = _lig_filters["ligand_substruct"]
+                    rdkit_query["ligand_substruct_pos"] = _lig_filters[
+                        "ligand_substruct_pos"
+                    ]
+                    rdkit_query["ligand_operator"] = _lig_filters["ligand_operator"]
+
+            ### Join each of the filter groups
             # if filter queries exist for each group, string them together appropriately
             if int_query:
                 # add with a join statement
@@ -2629,24 +2646,26 @@ class StorageManagerSQLite(StorageManager):
                     "JOIN (" + lig_query + ") L ON R.LigName = L.LigName "
                 )
                 # these two queries are joined on the Results table, after the multiple table spanning queries
-            if num_query or ligand_substruct_queries:
+            if num_query:
                 # add condition
-                unclustered_query += "WHERE "
-                # add numerical part of query
-                if num_query:
-                    unclustered_query += num_query
-                # if both numerical and ligand_substruct_pos handle appropriately
-                if num_query and ligand_substruct_queries:
-                    unclustered_query += " AND " + join_stmnt.join(
-                        ligand_substruct_queries
-                    )
-                # if not, only the ligand_substruct_pos sets the WHERE condition
-                else:
-                    unclustered_query += join_stmnt.join(ligand_substruct_queries)
+                unclustered_query += "WHERE " + num_query
 
+        ###TODO at this point we have all the in-db filters, and we should run them
+
+        # run the rdkit queries first
+        if rdkit_query:
+            # run the unclustered_query,
+            # stream results into memory
+            # run the substruct search
+            # if substruct_pos requested
+            # return pose_ids relevant for this
+            # else
+            # return pose_ids from the query
+            # unclustered_query = pose_ids returned from substruct search
+            pass
         # if clustering is requested, do that before saving view or filtering results for output
         if clustering:
-            # add appropriate select
+            # if substruct, unclustered query is now mostly pose_ids. If not, it is a full normal query
             try:
                 query = self._prepare_cluster_query(unclustered_query)
                 query = "WHERE " + query
@@ -2785,10 +2804,18 @@ class StorageManagerSQLite(StorageManager):
                     )
 
         if self.mfpt_cluster:
-            cluster_query = f"SELECT R.Pose_ID, R.leff, mol_morgan_bfp(L.ligand_rdmol, 2, 1024) FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE R.Pose_ID IN ({unclustered_query})"
+            cluster_query = f"SELECT R.Pose_ID, R.leff, L.ligand_rdmol FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE R.Pose_ID IN ({unclustered_query})"
             poseid_leff_mfps = self._run_query(cluster_query).fetchall()
+            # deserialize mols
+            rdmols = [Chem.JSONToMols(row[2]) for row in poseid_leff_mfps]
+            # create morgan fingerprints
+            mfps = [
+                Chem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=1024)
+                for mol in rdmols
+            ]
+            # create the clusters from the binary form of the fingerprint
             bclusters = _clusterFps(
-                [DataStructs.CreateFromBinaryText(mol[2]) for mol in poseid_leff_mfps],
+                [DataStructs.CreateFromBinaryText(mfp) for mfp in mfps],
                 self.mfpt_cluster,
             )
             self.logger.info(
@@ -2932,6 +2959,7 @@ class StorageManagerSQLite(StorageManager):
         return query
 
     def _ligand_substructure_position_filter(self, ligand_filters_dict: dict) -> str:
+        # TODO
         """
         Method that takes all ligand filters in the presence of a ligand_substruct_pos filter, and reduces the query to
         " IN pose_ids" based on what pose_ids passed the ligand filters
