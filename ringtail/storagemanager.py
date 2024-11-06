@@ -2680,10 +2680,10 @@ class StorageManagerSQLite(StorageManager):
             )
             if "ligand_substruct_pos" in _lig_filters:
                 # TODO if substruct pos, need to add these substructs to the filter before
-                pose_ids_with_substruct_pos = self._ligand_substructure_position_filter(
+                unclustered_query = self._ligand_substructure_position_filter(
                     unclustered_query, _lig_filters
                 )
-            unclustered_query = "WHERE" + unclustered_query
+            unclustered_query = " WHERE " + unclustered_query
 
         # if clustering is requested, do that before saving view or filtering results for output
         if clustering:
@@ -3006,56 +3006,33 @@ class StorageManagerSQLite(StorageManager):
             str: partial query that identifies pose ids passing the ligand substructure filter
         """
         queries = []
-        nr_args_per_group = 6
-        nr_smarts = int(
-            len(ligand_filters_dict["ligand_substruct_pos"]) / nr_args_per_group
-        )
+        nr_smarts = len(ligand_filters_dict["ligand_substruct_pos"])
+        # remove temp table if already in session
+        cur = self.conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS passed_smarts")
 
         # new query that gets the necessary information from the already filtered pose ids
         query = f"""SELECT R.Pose_ID, L.ligand_smile, L.atom_index_map, R.ligand_coordinates 
         FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE {filtered_poses_query} """
-
-        # I can replace all this by taking the passing pose ids from the substruct search, and make a temp table
-        # with some extra data, and I wouldn't even have to write much more code
         query = "CREATE TEMP TABLE passed_smarts AS " + query
-        cur = self.conn.cursor()
-        cur.execute("DROP TABLE IF EXISTS passed_smarts")
-        try:
-            cur.execute(query)
-        except:
-            print("Failed to make new temporary table for ligand substructure search.")
+        cur.execute(query)
 
         smarts_loc_filters = []
         for i in range(nr_smarts):
-            smarts = ligand_filters_dict["ligand_substruct_pos"][
-                i * nr_args_per_group + 0
-            ]
-            index = int(
-                ligand_filters_dict["ligand_substruct_pos"][i * nr_args_per_group + 1]
-            )
-            sqdist = (
-                float(
-                    ligand_filters_dict["ligand_substruct_pos"][
-                        i * nr_args_per_group + 2
-                    ]
-                )
-                ** 2
-            )
-            x = float(
-                ligand_filters_dict["ligand_substruct_pos"][i * nr_args_per_group + 3]
-            )
-            y = float(
-                ligand_filters_dict["ligand_substruct_pos"][i * nr_args_per_group + 4]
-            )
-            z = float(
-                ligand_filters_dict["ligand_substruct_pos"][i * nr_args_per_group + 5]
-            )
-            # save filter for bookmark
+            smarts = ligand_filters_dict["ligand_substruct_pos"][i][0]
+            index = int(ligand_filters_dict["ligand_substruct_pos"][i][1])
+            sqdist = float(ligand_filters_dict["ligand_substruct_pos"][i][2]) ** 2
+            x = float(ligand_filters_dict["ligand_substruct_pos"][i][3])
+            y = float(ligand_filters_dict["ligand_substruct_pos"][i][4])
+            z = float(ligand_filters_dict["ligand_substruct_pos"][i][5])
+            # append processed data to list of filters as a tuple
             smarts_loc_filters.append((smarts, index, x, y, z))
-            poses = self._run_query("SELECT * FROM passed_smarts")
+            # get all results that passed former filters
+            pre_filtered_results = self._run_query("SELECT * FROM passed_smarts")
             pose_id_list = []
             smartsmol = Chem.MolFromSmarts(smarts)
-            for pose_id, _, smiles, idxmap, coords in poses:
+            # iterate through each unique pose
+            for pose_id, smiles, idxmap, coords in pre_filtered_results:
                 mol = Chem.MolFromSmiles(smiles)
                 idxmap = [int(value) - 1 for value in json.loads(idxmap)]
                 idxmap = {
@@ -3071,14 +3048,14 @@ class StorageManagerSQLite(StorageManager):
                         pose_id_list.append(str(pose_id))
                         break  # add pose only once
             if len(pose_id_list) > 0:
-                queries.append("R.Pose_ID IN ({0})".format(",".join(pose_id_list)))
+                queries.append(" R.Pose_ID IN ({0}) ".format(",".join(pose_id_list)))
         cur.close()
         if not queries:
             raise OptionError(
                 "There are no ligands passing the 'ligand_substruct_pos' filter, please revise your filter query."
             )
 
-        return "".join(queries)
+        return ligand_filters_dict["ligand_operator"].join(queries)
 
     def _generate_interaction_bitvectors(self, pose_ids: str) -> dict:
         """
