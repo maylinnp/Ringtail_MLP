@@ -2679,7 +2679,6 @@ class StorageManagerSQLite(StorageManager):
                 ",".join(map(str, passing_pose_ids))
             )
             if "ligand_substruct_pos" in _lig_filters:
-                # TODO if substruct pos, need to add these substructs to the filter before
                 unclustered_query = self._ligand_substructure_position_filter(
                     unclustered_query, _lig_filters
                 )
@@ -3551,15 +3550,6 @@ class StorageManagerSQLite(StorageManager):
         """
         try:
             con = sqlite3.connect(self.db_file)
-            try:
-                con.enable_load_extension(True)
-                con.load_extension("chemicalite")
-                con.enable_load_extension(False)
-            except sqlite3.OperationalError as e:
-                self.logger.critical(
-                    "Failed to load chemicalite cartridge. Please ensure chemicalite is installed with `conda install -c conda-forge chemicalite`."
-                )
-                raise e
             cursor = con.execute("PRAGMA synchronous = OFF;")
             cursor.execute("PRAGMA journal_mode = MEMORY;")
             con.commit()

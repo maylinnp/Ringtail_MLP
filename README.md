@@ -78,12 +78,6 @@ You may need to install one or more of the listed dependencies, please note that
 $ pip install <dependency>
 ```
 
-Chemicalite is required and only available on conda-forge:
-
-```bash
-$ conda install -c conda-forge chemicalite
-```
-
 #### From conda-forge
 Ringtail 2 is now available on conda-forge, and installation from conda-forge will handle all of the dependencies. 
 

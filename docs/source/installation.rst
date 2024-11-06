@@ -20,13 +20,10 @@ A few dependencies may be needed, including:
 * multiprocess (only needed on MacOS)
 * scipy
 * pandas
-* chemicalite (only available through conda-forge)
 
 .. code-block:: bash
 
     $ pip install <dependency>
-
-    $ conda install -c conda-forge chemicalite
 
 Upgrading to a newer Ringtail version
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
