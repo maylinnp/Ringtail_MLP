@@ -19,7 +19,3 @@ There are a few quick checks the user can make to ensure that the data has been 
 - The number of rows in the ``Results`` table should be ~ ``max_poses`` * ``number of files`` and should be less than or equal to that number. For DLGs not every ligand may have up to ``max_poses``, which is why the number of rows is typically smaller than ``max_poses`` * ``number of DLGs``.
 - No ligand should have more than ``max_poses`` rows in the ``Results`` table.
 - If storing all poses, the number of rows in the Results table should match the ``number of ligands`` * ``number of output poses``.
-
-A note about visualizing bookmarks produced by ligand filters
-*************************************************************
-If using visidata to look at a bookmark produced by using ligand filters, the bookmark will most likely appear blank. This is due to database connection settings in visidata and the use of the sqlite extension ``chemicalite`` (used to aid in the ligand filters). The bookmark will still work as expected when using Ringtail functionality, for example you can write the bookmark to a csv file, or use the bookmark as basis for the next round of filtering. 
