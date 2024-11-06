@@ -1672,7 +1672,6 @@ class StorageManagerSQLite(StorageManager):
     def create_bookmark(self, name, query, temp=False, add_poseID=False, filters={}):
         """Takes name and selection query and creates a bookmark of name.
         Bookmarks are Ringtail specific views that whose information is stored in the 'Bookmark' table.
-        #FIXME bug where ligand filter only results are not added as bookmarks
 
         Args:
             name (str): Name for bookmark which will be created
@@ -1865,13 +1864,6 @@ class StorageManagerSQLite(StorageManager):
     # endregion
 
     # region Methods for getting information from database
-    def count_heavy_atoms(self, ligname):
-        # TODO
-        # a simple test method to count heavy atoms of a ligand
-        query = f"""SELECT JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') FROM Ligands 
-        WHERE LigName = {ligname}"""
-        return self._run_query(query).fetchone()
-
     def fetch_receptor_object_by_name(self, rec_name):
         """Returns Receptor object from database for given rec_name
 
@@ -2559,7 +2551,7 @@ class StorageManagerSQLite(StorageManager):
 
         # process filter values to lists and dicts that are easily incorporated in sql queries
         processed_filters = self._process_filters_for_query(filters_dict)
-        print("Processed filters: ", processed_filters)
+
         # raise error if no filters are present and no clusterings
         if not processed_filters and not clustering:
             raise DatabaseQueryError(
@@ -2665,10 +2657,10 @@ class StorageManagerSQLite(StorageManager):
                     self._perform_ligand_substruct_filter(query, _lig_filters)
                 )
             except OutputError as e:
-                self.logger.warning(e)
-                return
+                self.logger.warning(str(e))
+                lignames_poseids_with_substructs = {}
 
-            # create a new unclustered query with just pose ids
+            # make one list of all pose_ids passing so far
             passing_pose_ids = []
             for _, poseids in lignames_poseids_with_substructs.items():
                 # loop through each list of pose ids and join them into a query
@@ -2689,7 +2681,7 @@ class StorageManagerSQLite(StorageManager):
             # if substruct, unclustered query is now mostly pose_ids. If not, it is a full normal query
             try:
                 query = self._prepare_cluster_query(unclustered_query)
-                query = "WHERE " + query
+                query = " WHERE " + query
             except OptionError as e:
                 raise e
         else:
@@ -2825,6 +2817,7 @@ class StorageManagerSQLite(StorageManager):
                     )
 
         if self.mfpt_cluster:
+            # get relevant data based on all filters specified
             cluster_query = f"SELECT R.Pose_ID, R.leff, L.ligand_rdmol FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE R.Pose_ID IN ({unclustered_query})"
             poseid_leff_mfps = self._run_query(cluster_query).fetchall()
 
@@ -2839,10 +2832,11 @@ class StorageManagerSQLite(StorageManager):
             for rdmol in poseid_leff_mfps:
                 # deserialize mols (JSONToMols returns tuple, hence the [0] subscript)])
                 mol = Chem.JSONToMols(rdmol[2])[0]
-                # need to sanitize each mol, have not been able to do it inline as it returns a santize flag and not the sanitized mol
+                # need to sanitize each mol like this (as opposed to inline) as the method has a return value of 'santize_flag'
                 Chem.SanitizeMol(mol)
                 mfps.append(mfpgenerator.GetFingerprint(mol))
 
+            # run the butina clustering
             bclusters = _clusterFps(
                 mfps,
                 self.mfpt_cluster,
@@ -2870,9 +2864,10 @@ class StorageManagerSQLite(StorageManager):
                     "No passing results prior to clustering. Clustering not performed."
                 )
             else:
-                cluster_query_string = "R.Pose_ID = " + " OR R.Pose_ID = ".join(
-                    fp_rep_poseids
+                cluster_query_string = " R.Pose_ID IN ({0})".format(
+                    ",".join(fp_rep_poseids)
                 )
+
         return cluster_query_string
 
     def _prepare_interaction_filtering_query(
@@ -2990,12 +2985,12 @@ class StorageManagerSQLite(StorageManager):
     def _ligand_substructure_position_filter(
         self, filtered_poses_query: str, ligand_filters_dict: dict
     ) -> str:
-        # TODO
         """
         Method that takes all ligand filters in the presence of a ligand_substruct_pos filter, and reduces the query to
-        " IN pose_ids" based on what pose_ids passed the ligand filters
+        " IN (<pose_ids>) " based on what pose_ids passed the ligand filters
 
         Args:
+            filtered_poses_query (str): sql query string for poses having passed regular filters
             ligand_filters_dict (dict): all specified ligand filters
 
         Raises:
@@ -3177,14 +3172,16 @@ class StorageManagerSQLite(StorageManager):
     def _perform_ligand_substruct_filter(
         self, query: str, ligand_filters: dict
     ) -> dict:
-        """write string to select from ligand table
+        """Will run a filtering query with regular filters, and perform RDKit 'GetSubstructMatch'
+        for each chosen substructure. The method streams 100 ligands into memory at once from the cursor
+        as it reads from the database, and checks for the substructure(s).
 
         Args:
-            query (str): query string for simple filters
-            ligand_filters (list): List of filters on ligand table
+            query (str): query string for regular filters, expected output columns:LigName,ligand_rdmol,Pose_id
+            ligand_filters (dict): List of filters on ligand table
 
         Returns:
-            dict: dict of ligand names and all their pose ids passing main+substruct filters
+            dict: dict of ligand names and all their pose ids passing regular+substruct filters
         """
 
         if "ligand_operator" in ligand_filters:
@@ -3209,11 +3206,18 @@ class StorageManagerSQLite(StorageManager):
                         )
                 smarts_mols.append(smarts_mol)
 
-            # my in memory query goes here
-            filtered_ligands_with_substructs = {}
-
             # generator of cursor stream
             def _stream_query(query: str, batch_size: int = 100):
+                """
+                cursor stream generator
+
+                Args:
+                    query (str): sql query
+                    batch_size (int): how many cursor hits to read into memory at once
+
+                Yields:
+                    cursor batch: cursor results for the query in batch increments, where row can be read
+                """
                 cursor = self.conn.cursor()
                 cursor.execute(query)
 
@@ -3224,12 +3228,13 @@ class StorageManagerSQLite(StorageManager):
                     for row in batch:
                         yield row
 
-            # the main unclustered query goes here, and should return ligand stuff by joining on ligand name of passing pose ids
+            filtered_ligands_with_substructs = {}
+            # read each row in the streamed "batch" of ligands
             for row in _stream_query(query):
-                # I need to keep track of the poses, but I only deal with lignamesand ligsmiles her essentially
-                # so, if ligname (row[0]) already in dict, I don't have to test it at all
+                # each row will be per pose_id [2], but we are only matching on ligand_smiles [1]
+                # for which there should exist only one per ligname.
                 if row[0] in filtered_ligands_with_substructs.keys():
-                    # in that case, append pose id (row[2]) to list under ligname to keep track of pose ids that passed main query
+                    # append pose id (row[2]) to list under ligname to keep track of pose ids that passed main query
                     filtered_ligands_with_substructs[row[0]].append(row[2])
                 # if ligname not in dict, it has not been tested yet so proceed with substruct matching
                 else:
@@ -3240,7 +3245,6 @@ class StorageManagerSQLite(StorageManager):
                     # check for each SMARTS if is substruct
                     for smarts_mol in smarts_mols:
                         is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
-                        # if match
                         if is_substruct:
                             # if ligand substruct operator is OR, only one match is needed to qualify the ligand
                             if logical_operator == "OR":
@@ -3248,10 +3252,10 @@ class StorageManagerSQLite(StorageManager):
                                 filtered_ligands_with_substructs[row[0]] = [row[2]]
                                 # stop testing this ligand since it just needed one match to pass
                                 break
-                            # if logical operator is AND, accumulate each match
+                            # if logical operator is AND, accumulate each substructure match
                             else:
                                 SMARTS_match += 1
-                    # if and operator, check if ligand matched on all smarts patterns
+                    # if AND operator, check if ligand matched on all smarts patterns
                     if logical_operator == "AND" and SMARTS_match == len(smarts_mols):
                         filtered_ligands_with_substructs[row[0]] = [row[2]]
 
