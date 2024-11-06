@@ -618,7 +618,10 @@ class StorageManagerSQLite(StorageManager):
         """
         ligand_name = ligand_dict["ligname"]
         ligand_smile = ligand_dict["ligand_smile_string"]
-        ligand_rdjson = Chem.MolToJSON(Chem.MolFromSmiles(ligand_smile))
+        ligand_mol = Chem.MolFromSmiles(ligand_smile)
+        # sanitize the ligand
+        Chem.SanitizeMol(ligand_mol)
+        ligand_rdjson = Chem.MolToJSON(ligand_mol)
         ligand_index_map = json.dumps(ligand_dict["ligand_index_map"])
         ligand_h_parents = json.dumps(ligand_dict["ligand_h_parents"])
         input_model = json.dumps(ligand_dict["ligand_input_model"])
@@ -2827,18 +2830,24 @@ class StorageManagerSQLite(StorageManager):
         if self.mfpt_cluster:
             cluster_query = f"SELECT R.Pose_ID, R.leff, L.ligand_rdmol FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE R.Pose_ID IN ({unclustered_query})"
             poseid_leff_mfps = self._run_query(cluster_query).fetchall()
-            # deserialize mols
-            rdmols = [Chem.JSONToMols(row[2]) for row in poseid_leff_mfps]
-            # create morgan fingerprints
-            mfps = [
-                Chem.rdMolDescriptors.GetMorganFingerprintAsBitVect(
-                    mol, radius=2, nBits=1024
-                )
-                for mol in rdmols
-            ]
-            # create the clusters from the binary form of the fingerprint
+
+            # create morgan fingerprint generator
+            from rdkit.Chem import rdFingerprintGenerator
+
+            mfpgenerator = rdFingerprintGenerator.GetMorganGenerator(
+                radius=2, fpSize=1024
+            )
+            mfps = []
+            # prepare each mol json to fingerprint
+            for rdmol in poseid_leff_mfps:
+                # deserialize mols (JSONToMols returns tuple, hence the [0] subscript)])
+                mol = Chem.JSONToMols(rdmol[2])[0]
+                # need to sanitize each mol, have not been able to do it inline as it returns a santize flag and not the sanitized mol
+                Chem.SanitizeMol(mol)
+                mfps.append(mfpgenerator.GetFingerprint(mol))
+
             bclusters = _clusterFps(
-                [DataStructs.CreateFromBinaryText(mfp) for mfp in mfps],
+                mfps,
                 self.mfpt_cluster,
             )
             self.logger.info(
