@@ -5,6 +5,8 @@
 #
 
 import sqlite3
+import sqlalchemy
+from sqlalchemy import text
 import time
 import json
 import pandas as pd
@@ -3714,48 +3716,61 @@ class StorageManagerSQLite(StorageManager):
 
 
 class StorageManagerSQLAlchemy(StorageManager):
-    pass
+    def __init__(self, db_name: str | None = None, dialect: str = "sqlite"):
+        import os
 
-
-"""
-    import sqlalchemy
-    from typing import List
-    from typing import Optional
-    from sqlalchemy import ForeignKey
-    from sqlalchemy import String
-    from sqlalchemy.orm import DeclarativeBase
-    from sqlalchemy.orm import Mapped
-    from sqlalchemy.orm import mapped_column
-    from sqlalchemy.orm import relationship
-
-    def __init__(self, db_file: str | None = None):
+        # can specify dbapi, else default
+        dbapi = ""
+        # will emit stuff that can be logged
+        echo = True
+        # print statements to follow process
         print("Initialized the SQL Alchemy class!")
-        print(f"My database file is this >>> {db_file}")
-        
+        print(f"My database file is this >>> {db_name}")
+        # create the engine connection statement
+        base_path = "/Users/maylinnp/forlilab/data/"
+        db_path = os.path.join(base_path, db_name)
+        crstring = dialect + ":///" + db_path
+        # create the engine
+        self.engine = sqlalchemy.create_engine(crstring, echo=echo)
+        print("Engine successfully created: ", self.engine)
 
-    class Base(DeclarativeBase):
-        pass
+    def __enter__(self):
+        try:
+            self.conn = self.engine.connect()
+            result = self.conn.execute(sqlalchemy.text("select 'hello world'"))
+            print(result.all())
+        except Exception as e:
+            print("There was an error connecting to the database: ", str(e))
+        else:
+            return self
 
-    class Result(Base):
-        __tablename__ = "results"
-        id: Mapped[int] = mapped_column(primary_key=True)
-        name: Mapped[str] = mapped_column(String(30))
-        fullname: Mapped[Optional[str]]
-        addresses: Mapped[List["Address"]] = relationship(
-            back_populates="user", cascade="all, delete-orphan"
+    def __exit__(self, exc_type, exc_value, tb):
+        # close connection?
+        if exc_type:
+            if exc_type == Exception:
+                print("There was an error during database operations: ", str(exc_value))
+            else:
+                raise
+        return self
+
+    def create_tables(self):
+        # some data types should be different depending on database type as there may be
+        # benefit to using more advanced datatypes in other dbs than sqlite
+        self._create_table(
+            table_name="Results",
+            pose_id="int",
+            ligname="varchar",
+            docking_score="float",
+            pk="pose_id",
+            fk=[""],
         )
 
-        def __repr__(self) -> str:
-            return f"User(id={self.id!r}, name={self.name!r}, fullname={self.fullname!r})"
+    def _create_table(self, table_name: str, pk: str, fk: list[str], **columns: str):
+        # handle primary and foreign key
 
-    class Interaction(Base):
-        __tablename__ = "interactions"
-        id: Mapped[int] = mapped_column(primary_key=True)
-        email_address: Mapped[str]
-        user_id: Mapped[int] = mapped_column(ForeignKey("user_account.id"))
-        user: Mapped["User"] = relationship(back_populates="addresses")
-
-        def __repr__(self) -> str:
-            return f"Address(id={self.id!r}, email_address={self.email_address!r})"
-        
-"""
+        # handle columns kwargs
+        column_list = list(map(lambda x: x[0] + " " + str(x[1]), columns.items()))
+        column_string = ",".join(column_list)
+        self.conn.execute(text(f"CREATE TABLE {table_name} ({column_string})"))
+        self.conn.commit()
+        print(f"Created the table {table_name} with columns {column_string}")
