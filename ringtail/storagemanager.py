@@ -29,7 +29,6 @@ from .exceptions import (
     DatabaseQueryError,
     DatabaseViewCreationError,
     OptionError,
-    OutputError,
 )
 
 import multiprocess
@@ -2126,10 +2125,9 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             pd.DataFrame: dataframe of requested data
         """
+        print("The requested data: ", requested_data)
         if table:
-            return pd.read_sql_query(
-                "SELECT * FROM {0}".format(requested_data), self.conn
-            )
+            return pd.read_sql_query(f"SELECT * FROM {requested_data}", self.conn)
         else:
             return pd.read_sql_query(requested_data, self.conn)
 
@@ -2656,7 +2654,7 @@ class StorageManagerSQLite(StorageManager):
                 lignames_poseids_with_substructs = (
                     self._perform_ligand_substruct_filter(query, _lig_filters)
                 )
-            except OutputError as e:
+            except OptionError as e:
                 self.logger.warning(str(e))
                 lignames_poseids_with_substructs = {}
 
@@ -2671,9 +2669,13 @@ class StorageManagerSQLite(StorageManager):
                 ",".join(map(str, passing_pose_ids))
             )
             if "ligand_substruct_pos" in _lig_filters:
-                unclustered_query = self._ligand_substructure_position_filter(
-                    unclustered_query, _lig_filters
-                )
+                try:
+                    unclustered_query = self._ligand_substructure_position_filter(
+                        unclustered_query, _lig_filters
+                    )
+                except OptionError as e:
+                    self.logger.warning(str(e))
+                    unclustered_query = " R.Pose_ID=-9999 "
             unclustered_query = " WHERE " + unclustered_query
 
         # if clustering is requested, do that before saving view or filtering results for output
@@ -3260,7 +3262,7 @@ class StorageManagerSQLite(StorageManager):
                         filtered_ligands_with_substructs[row[0]] = [row[2]]
 
         if not filtered_ligands_with_substructs:
-            raise OutputError("No ligands passing the substructure filter.")
+            raise OptionError("No ligands passing the substructure filter.")
         else:
             return filtered_ligands_with_substructs
 
