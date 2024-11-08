@@ -579,7 +579,7 @@ class StorageManagerSQLite(StorageManager):
         """Create table for ligands. Columns are:
         LigName             VARCHAR NOT NULL,
         ligand_smile        VARCHAR[],
-        ligand_rdmol        VARCHAR[],
+        ligand_rdmol        BLOB,
         atom_index_map      VARCHAR[],
         hydrogen_parents    VARCHAR[],
         input_model         VARCHAR[]
@@ -591,7 +591,7 @@ class StorageManagerSQLite(StorageManager):
         ligand_table = """CREATE TABLE IF NOT EXISTS Ligands (
             LigName             VARCHAR NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
             ligand_smile        VARCHAR[],
-            ligand_rdmol        VARCHAR[],
+            ligand_rdmol        BLOB,
             atom_index_map      VARCHAR[],
             hydrogen_parents    VARCHAR[],
             input_model         VARCHAR[])"""
@@ -614,7 +614,7 @@ class StorageManagerSQLite(StorageManager):
 
         Returns:
             List: List of data to be written as row in ligand table. Format:
-                [ligand_name, ligand_smile, ligand_index_map,
+                [ligand_name, ligand_smile, ligand_rdbin, ligand_index_map,
                 ligand_h_parents, input_model]
         """
         ligand_name = ligand_dict["ligname"]
@@ -622,7 +622,7 @@ class StorageManagerSQLite(StorageManager):
         ligand_mol = Chem.MolFromSmiles(ligand_smile)
         # sanitize the ligand
         Chem.SanitizeMol(ligand_mol)
-        ligand_rdjson = Chem.MolToJSON(ligand_mol)
+        ligand_rdbin = ligand_mol.ToBinary()
         ligand_index_map = json.dumps(ligand_dict["ligand_index_map"])
         ligand_h_parents = json.dumps(ligand_dict["ligand_h_parents"])
         input_model = json.dumps(ligand_dict["ligand_input_model"])
@@ -630,7 +630,7 @@ class StorageManagerSQLite(StorageManager):
         return [
             ligand_name,
             ligand_smile,
-            ligand_rdjson,
+            ligand_rdbin,
             ligand_index_map,
             ligand_h_parents,
             input_model,
@@ -2649,16 +2649,14 @@ class StorageManagerSQLite(StorageManager):
 
         # run the rdkit queries first
         if rdkit_query:
+            lignames_poseids_with_substructs = {}
+            position_search = bool("ligand_substruct_pos" in _lig_filters)
             # run the unclustered_query with appropriate select statement, keeping track of passing pose ids
             query = f"SELECT Ligands.LigName, Ligands.ligand_rdmol, R.Pose_id FROM {filtering_window} R JOIN Ligands ON Ligands.LigName = R.LigName {unclustered_query}"
-            try:
-                # get dict of ligands and pose ids passing all filters including substruct
-                lignames_poseids_with_substructs = (
-                    self._perform_ligand_substruct_filter(query, _lig_filters)
-                )
-            except OptionError as e:
-                self.logger.warning(str(e))
-                lignames_poseids_with_substructs = {}
+            # get dict of ligands and pose ids passing all filters including substruct
+            lignames_poseids_with_substructs = self._perform_ligand_substruct_filter(
+                query, _lig_filters, position_search
+            )
 
             # make one list of all pose_ids passing so far
             passing_pose_ids = []
@@ -2670,7 +2668,7 @@ class StorageManagerSQLite(StorageManager):
             unclustered_query = " R.Pose_ID IN ({0})".format(
                 ",".join(map(str, passing_pose_ids))
             )
-            if "ligand_substruct_pos" in _lig_filters:
+            if position_search:
                 try:
                     unclustered_query = self._ligand_substructure_position_filter(
                         unclustered_query, _lig_filters
@@ -2986,6 +2984,7 @@ class StorageManagerSQLite(StorageManager):
 
         return query
 
+    @profile
     def _ligand_substructure_position_filter(
         self, filtered_poses_query: str, ligand_filters_dict: dict
     ) -> str:
@@ -3010,7 +3009,7 @@ class StorageManagerSQLite(StorageManager):
         cur.execute("DROP TABLE IF EXISTS passed_smarts")
 
         # new query that gets the necessary information from the already filtered pose ids
-        query = f"""SELECT R.Pose_ID, L.ligand_smile, L.atom_index_map, R.ligand_coordinates 
+        query = f"""SELECT R.Pose_ID, L.ligand_smile, L.ligand_rdmol, L.atom_index_map, R.ligand_coordinates 
         FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE {filtered_poses_query} """
         query = "CREATE TEMP TABLE passed_smarts AS " + query
         cur.execute(query)
@@ -3030,8 +3029,8 @@ class StorageManagerSQLite(StorageManager):
             pose_id_list = []
             smartsmol = Chem.MolFromSmarts(smarts)
             # iterate through each unique pose
-            for pose_id, smiles, idxmap, coords in pre_filtered_results:
-                mol = Chem.MolFromSmiles(smiles)
+            for pose_id, smiles, rdbin, idxmap, coords in pre_filtered_results:
+                mol = Chem.Mol(rdbin)
                 idxmap = [int(value) - 1 for value in json.loads(idxmap)]
                 idxmap = {
                     idxmap[j * 2]: idxmap[j * 2 + 1]
@@ -3173,8 +3172,9 @@ class StorageManagerSQLite(StorageManager):
 
         return self._run_query(sql_string).fetchall()
 
+    @profile
     def _perform_ligand_substruct_filter(
-        self, query: str, ligand_filters: dict
+        self, query: str, ligand_filters: dict, position_search: bool = False
     ) -> dict:
         """Will run a filtering query with regular filters, and perform RDKit 'GetSubstructMatch'
         for each chosen substructure. The method streams 100 ligands into memory at once from the cursor
@@ -3211,7 +3211,7 @@ class StorageManagerSQLite(StorageManager):
                 smarts_mols.append(smarts_mol)
 
             # generator of cursor stream
-            def _stream_query(query: str, batch_size: int = 100):
+            def _stream_query(query: str, batch_size: int = 10):
                 """
                 cursor stream generator
 
@@ -3243,7 +3243,8 @@ class StorageManagerSQLite(StorageManager):
                 # if ligname not in dict, it has not been tested yet so proceed with substruct matching
                 else:
                     # deserialize rdmol
-                    ligand_mol = Chem.JSONToMols(row[1])[0]
+
+                    ligand_mol = Chem.Mol(row[1])
                     # count how many matches
                     SMARTS_match = 0
                     # check for each SMARTS if is substruct
@@ -3262,11 +3263,7 @@ class StorageManagerSQLite(StorageManager):
                     # if AND operator, check if ligand matched on all smarts patterns
                     if logical_operator == "AND" and SMARTS_match == len(smarts_mols):
                         filtered_ligands_with_substructs[row[0]] = [row[2]]
-
-        if not filtered_ligands_with_substructs:
-            raise OptionError("No ligands passing the substructure filter.")
-        else:
-            return filtered_ligands_with_substructs
+        return filtered_ligands_with_substructs
 
     def _generate_selective_insert_query(
         self, bookmark1_name, bookmark2_name, select_str, new_db_name, temp_table
@@ -3729,6 +3726,7 @@ class StorageManagerSQLAlchemy(StorageManager):
         # create the engine connection statement
         base_path = "/Users/maylinnp/forlilab/data/"
         db_path = os.path.join(base_path, db_name)
+        self.dialect = dialect
         crstring = dialect + ":///" + db_path
         # create the engine
         self.engine = sqlalchemy.create_engine(crstring, echo=echo)
@@ -3753,24 +3751,98 @@ class StorageManagerSQLAlchemy(StorageManager):
                 raise
         return self
 
+    def _float(self):
+        types = {"sqlite": "float"}
+        return types[self.dialect]
+
     def create_tables(self):
-        # some data types should be different depending on database type as there may be
-        # benefit to using more advanced datatypes in other dbs than sqlite
+
+        # results table
         self._create_table(
             table_name="Results",
-            pose_id="int",
-            ligname="varchar",
-            docking_score="float",
+            pose_id="integer",
+            ligname="varchar NOT NULL",
+            receptor="varchar",
+            pose_rank="int",
+            run_number="int",
+            docking_score="float(4)",
+            leff="float(4)",
+            deltas="float(4)",
+            cluster_rmsd="float(4)",
+            cluster_size="int",
+            reference_rmsd="float(4)",
+            energies_inter="float(4)",
+            energies_vdw="float(4)",
+            energies_electro="float(4)",
+            energies_flexLig="float(4)",
+            energies_flexLR="float(4)",
+            energies_intra="float(4)",
+            energies_torsional="float(4)",
+            unbound_energy="float(4)",
+            nr_interactions="int",
+            num_hb="int",
+            about_x="float(4)",
+            about_y="float(4)",
+            about_z="float(4)",
+            trans_x="float(4)",
+            trans_y="float(4)",
+            trans_z="float(4)",
+            axisangle_x="float(4)",
+            axisangle_y="float(4)",
+            axisangle_z="float(4)",
+            axisangle_w="float(4)",
+            dihedrals="varchar",
+            ligand_coordinates="varchar",
+            flexible_res_coordinates="varchar",
             pk="pose_id",
-            fk=[""],
+            fk={},
         )
 
-    def _create_table(self, table_name: str, pk: str, fk: list[str], **columns: str):
-        # handle primary and foreign key
+        # ligands table
+        self._create_table(
+            table_name="Ligands",
+            LigName="varchar NOT NULL PRIMARY KEY ON CONFLICT IGNORE",
+            ligand_smile="varchar",
+            ligand_rdmol="varchar",
+            atom_index_map="varchar",
+            hydrogen_parents="varchar",
+            input_model="varchar",
+        )
 
+    def _create_table(
+        self,
+        table_name: str,
+        pk: str | None = None,
+        fk: dict[str, dict[str, str]] | None = None,
+        **columns: str,
+    ):
+        # handle primary key
+        if pk:
+            try:
+                # adds primary key designator to the column spec
+                columns[pk] = columns[pk] + " PRIMARY KEY AUTOINCREMENT"
+            except KeyError:
+                raise StorageError(
+                    f"""The primary key {pk} does not match any of the columns in the table {table_name}."""
+                )
         # handle columns kwargs
-        column_list = list(map(lambda x: x[0] + " " + str(x[1]), columns.items()))
-        column_string = ",".join(column_list)
-        self.conn.execute(text(f"CREATE TABLE {table_name} ({column_string})"))
-        self.conn.commit()
-        print(f"Created the table {table_name} with columns {column_string}")
+        spec_list = list(map(lambda x: x[0] + " " + str(x[1]), columns.items()))
+
+        if fk:
+            for key, value in fk.items():
+                spec_list.append(
+                    f""" CONSTRAINT {key}_fk FOREIGN KEY ({key}) REFERENCES {value["foreign_table"]} ({value["foreign_table_key"]}) """
+                )
+
+        specifications = ",".join(spec_list)
+        try:
+            self.conn.execute(text(f"CREATE TABLE {table_name} ({specifications})"))
+            self.conn.commit()
+        except sqlalchemy.exc.OperationalError as e:
+            raise DatabaseTableCreationError(
+                f"Error while creating {table_name} table. If database already exists, use --overwrite to drop existing tables"
+            ) from e
+        else:
+            print(
+                f"Created the table {table_name} with the following specifications {specifications}, primary key {pk} and foreign keys {fk}."
+            )
