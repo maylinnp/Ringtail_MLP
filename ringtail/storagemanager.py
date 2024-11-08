@@ -2984,7 +2984,7 @@ class StorageManagerSQLite(StorageManager):
 
         return query
 
-    @profile
+    # @profile
     def _ligand_substructure_position_filter(
         self, filtered_poses_query: str, ligand_filters_dict: dict
     ) -> str:
@@ -3172,7 +3172,7 @@ class StorageManagerSQLite(StorageManager):
 
         return self._run_query(sql_string).fetchall()
 
-    @profile
+    # @profile
     def _perform_ligand_substruct_filter(
         self, query: str, ligand_filters: dict, position_search: bool = False
     ) -> dict:
