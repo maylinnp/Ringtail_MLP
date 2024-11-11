@@ -2481,14 +2481,8 @@ class StorageManagerSQLite(StorageManager):
             # if filter has to do with ligands and SMARTS
             if filter_key in Filters.get_filter_keys("ligand"):
                 if filter_key == "ligand_substruct_pos" and filter_value:
-                    # make sure ligand_substruct in filter dict
-                    # if "ligand_substruct" not in ligand_filters:
-                    #     ligand_filters["ligand_substruct"] = []
                     # go through each item and make sure the numbers are cast from string to numbers
                     for filter in filter_value:
-                        # add first item (substruct) to ligand_substruct filter if needed
-                        if filter[0] not in ligand_filters["ligand_substruct"]:
-                            ligand_filters["ligand_substruct"].append(filter[0])
                         # cast second item to int
                         filter[1] = int(filter[1])
                         # cast last four items to float
@@ -2817,68 +2811,50 @@ class StorageManagerSQLite(StorageManager):
         filtered_ligands = {}
 
         for ligandrow in _stream_query(query):
-            # keep track if ligand has passed or failed filter
+            # keeps track of how many filters ligand passed
             passing = 0
             # substruct and maxatoms do not discriminate on poses, check if ligand has already been accounted for
-            if not position and ligandrow[0] in filtered_ligands.keys():
-                # append pose_id (ligandrow[0]) to list under ligname ligandrow [1]to keep track of pose ids that passed main query
+            if not position and ligandrow[1] in list(filtered_ligands.keys()):
+                # append pose_id (ligandrow[0]) to ligname ligandrow[1] list
                 filtered_ligands[ligandrow[1]].append(ligandrow[0])
-                print("Already in the list, added its next pose")
             # the real workhorse
             else:
-                # deserialize rdmol
+                # deserialize binary rdmol
                 ligand_mol = Chem.Mol(ligandrow[2])
                 # check if qualify for maxatoms
                 if maxatoms > 0:
                     if ligand_mol.GetNumHeavyAtoms() <= maxatoms:
-                        # add ligand and pose_id to filtered_ligands dict
-                        # filtered_ligands[row[1]] = row[0]
+                        # passed this filter
                         passing += 1
                     else:
-                        # ligand did not pass filter and does not need to be tested further
-                        # continues to the next row in _stream_query loop
+                        # ligand did not pass filter, continue to next row/ligand
                         continue
                 # if there are substructures in the search
                 if substruct_mols:
-                    """This can all be a function, ran here and for substruct_pos"""
                     # count how many matches
                     SMARTS_match = 0
-                    failed = False
                     # check for each SMARTS if is substruct
                     for smarts_mol in substruct_mols:
                         is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
                         if is_substruct:
                             # if ligand substruct operator is OR, only one match is needed to qualify the ligand
                             if logical_operator == "OR":
-                                # count each passing filter
+                                # ligand passed
                                 passing += 1
-                                # add ligand to dict with its pose id
-                                # filtered_ligands[row[0]] = [row[2]]
-                                # stop testing this ligand since it just needed one match to pass
                                 # breaks the smarts_mol in substruct_mols loop
                                 break
                             # logical operator is AND, accumulate each substructure match
-                            else:
+                            elif logical_operator == "AND":
                                 SMARTS_match += 1
-                        else:  # if "AND" and more substructs
-                            # ligand failed filter
-                            failed = True
-                            # this will break the smarts_mol in substruct_mols loop
-                            break
-                    # conitinues to the next row in _stream_query loop
-                    if failed:
-                        continue
                     # at the end, if AND operator, check if ligand matched on all smarts patterns
                     if logical_operator == "AND" and SMARTS_match == len(
                         substruct_mols
                     ):
                         passing += 1
-                    # filtered_ligands[row[1]] = [row[0]]
                 # should only make it here if the other two filters didn't 'continue' the main for loop
                 if position:
                     # count how many matches
                     SMARTS_pos_match = 0
-                    failed = False
                     # check for each SMARTS if is substruct
                     for filterrow in substruct_pos:
                         smarts_mol = _smarts_to_mol(filterrow[0])
@@ -2896,55 +2872,25 @@ class StorageManagerSQLite(StorageManager):
                                 if logical_operator == "OR":
                                     # count each passing filter
                                     passing += 1
-                                    # add ligand to dict with its pose id
-                                    # filtered_ligands[row[0]] = [row[2]]
                                 # if logical operator is AND, accumulate each substructure match
                                 else:
-                                    print(
-                                        " One passed the filter, but we need all of them"
-                                    )
                                     SMARTS_pos_match += 1
                                 # breaks for hit in ligand_mol.GetSubstructMatches(smarts_mol)
                                 break
-                            else:
-                                # iterates to the next hit of the substruct in the ligand
-                                continue
-
-                        # if passed_substruct_pos:
-                        #     if logical_operator == "OR":
-                        #         # breaks for filterrow in substruct_pos, because we got our one match, move on to next row/ligand
-                        #         print(
-                        #             "!!!!!!leaving the substruct pos search beacuse we found one and only need one"
-                        #         )
-                        #         break
-                        #     elif logical_operator == "AND":
-                        #         # one more match, test next one
-                        #         SMARTS_pos_match = +1
-                        #         print(
-                        #             "Continuing to the next substruct search because we need all"
-                        #         )
-                        #         print("continuing going through the filters")
-                        #         continue
-                        # else:
-                        #     # ligand failed, moving on to the next one
-                        #     print("testing next ligand")
-                        #     # breaks out of for hit in ligand_mol.GetSubstructMatches(smarts_mol)
-                        #     break
+                    # if 'AND', make sure ligand passed all substructure position filters
                     if logical_operator == "AND" and SMARTS_pos_match == len(
                         substruct_pos
                     ):
                         passing += 1
             # if ligand/ligand and pose id passed all specified rdkit filters
-            print(
-                f"{ligandrow[1]} passed {passing} filters out of {num_of_filters} total."
-            )
             if passing == num_of_filters:
-                print("Yup this one passed! ")
-                # add ligand to dict with its pose id
-                filtered_ligands[ligandrow[1]] = [ligandrow[0]]
-                # continue to the next one
-                continue
-        print("filtered_ligands", filtered_ligands)
+                # add pose id to list if ligand already in the list
+                if ligandrow[1] in list(filtered_ligands.keys()):
+                    filtered_ligands[ligandrow[1]].append(ligandrow[0])
+                # add new ligand in the list of passing ligands
+                else:
+                    filtered_ligands[ligandrow[1]] = [ligandrow[0]]
+
         return filtered_ligands
 
     # @profile
@@ -3079,7 +3025,7 @@ class StorageManagerSQLite(StorageManager):
             # prepare each mol json to fingerprint
             for rdmol in poseid_leff_mfps:
                 # deserialize mols (JSONToMols returns tuple, hence the [0] subscript)])
-                mol = Chem.JSONToMols(rdmol[2])[0]
+                mol = Chem.Mol(rdmol[2])
                 # need to sanitize each mol like this (as opposed to inline) as the method has a return value of 'santize_flag'
                 Chem.SanitizeMol(mol)
                 mfps.append(mfpgenerator.GetFingerprint(mol))
