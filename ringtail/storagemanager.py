@@ -2482,8 +2482,8 @@ class StorageManagerSQLite(StorageManager):
             if filter_key in Filters.get_filter_keys("ligand"):
                 if filter_key == "ligand_substruct_pos" and filter_value:
                     # make sure ligand_substruct in filter dict
-                    if "ligand_substruct" not in ligand_filters:
-                        ligand_filters["ligand_substruct"] = []
+                    # if "ligand_substruct" not in ligand_filters:
+                    #     ligand_filters["ligand_substruct"] = []
                     # go through each item and make sure the numbers are cast from string to numbers
                     for filter in filter_value:
                         # add first item (substruct) to ligand_substruct filter if needed
@@ -2525,7 +2525,7 @@ class StorageManagerSQLite(StorageManager):
         outfield_columns = self._generate_outfield_list()
         num_query = ""
         int_query = ""
-        lig_query = ""
+        ligname_query = ""
         rdkit_query = False
 
         # if filtering over a bookmark (i.e., already filtered results) as opposed to a whole database
@@ -2581,6 +2581,7 @@ class StorageManagerSQLite(StorageManager):
                 num_query = " AND ".join(
                     ["R." + filter for filter in processed_filters["num_filters"]]
                 )
+
             # check for interactions and prepare for query
             if "int_filters" in processed_filters:
                 # if interaction filters are present and valid, two lists of included and excluded interactions are returned
@@ -2598,35 +2599,25 @@ class StorageManagerSQLite(StorageManager):
                         exclude_interactions,
                         processed_filters["max_miss"],
                     )
+
             # check if ligand filters and prepare for query
             if "lig_filters" in processed_filters:
-                _lig_filters = processed_filters["lig_filters"]
-                _lig_queries = []
-                if "ligand_name" in _lig_filters or "ligand_max_atoms" in _lig_filters:
-                    # join all non-rdkit ligand queries that are not empty
-                    if "ligand_name" in _lig_filters:
-                        _lig_names = _lig_filters["ligand_name"]
-                        _ligname_query = " OR ".join(
-                            [
-                                f"LigName LIKE '%{ligname}%' "
-                                for ligname in _lig_names
-                                if ligname
-                            ]
-                        )
-                        _lig_queries.append(_ligname_query)
-                    if "ligand_max_atoms" in _lig_filters:
-                        _lig_maxatoms = _lig_filters["ligand_max_atoms"]
-                        _ligatom_query = f" (JSON_ARRAY_LENGTH(json(ligand_rdmol), '$.molecules[0].extensions[0].cipRanks') <= {_lig_maxatoms}) "
-                        _lig_queries.append(_ligatom_query)
-
-                    lig_query = "SELECT LigName FROM Ligands WHERE " + " AND ".join(
-                        [query for query in _lig_queries if query]
+                lig_filters = processed_filters["lig_filters"]
+                if "ligand_name" in lig_filters:
+                    lig_names = lig_filters["ligand_name"]
+                    ligname_query = " OR ".join(
+                        [
+                            f"LigName LIKE '%{ligname}%' "
+                            for ligname in lig_names
+                            if ligname
+                        ]
                     )
-
-                # substruct queries need to be handled in memory separate from the main query
+                    ligname_query = "SELECT LigName FROM Ligands WHERE " + ligname_query
+                # rdkit queries need to be handled in memory separate from the main query
                 if (
-                    "ligand_substruct" in _lig_filters
-                    or "ligand_substruct_pos" in _lig_filters
+                    "ligand_substruct" in lig_filters
+                    or "ligand_substruct_pos" in lig_filters
+                    or "ligand_max_atoms" in lig_filters
                 ):
                     rdkit_query = True
 
@@ -2637,10 +2628,10 @@ class StorageManagerSQLite(StorageManager):
                 unclustered_query += (
                     "JOIN (" + int_query + ") I ON R.Pose_ID = I.Pose_ID "
                 )
-            if lig_query:
+            if ligname_query:
                 # add with a join statement
                 unclustered_query += (
-                    "JOIN (" + lig_query + ") L ON R.LigName = L.LigName "
+                    "JOIN (" + ligname_query + ") L ON R.LigName = L.LigName "
                 )
                 # these two queries are joined on the Results table, after the multiple table spanning queries
             if num_query:
@@ -2650,14 +2641,13 @@ class StorageManagerSQLite(StorageManager):
         # run the rdkit queries first
         if rdkit_query:
             lignames_poseids_with_substructs = {}
-            position_search = bool("ligand_substruct_pos" in _lig_filters)
             # run the unclustered_query with appropriate select statement, keeping track of passing pose ids
-            query = f"SELECT Ligands.LigName, Ligands.ligand_rdmol, R.Pose_id FROM {filtering_window} R JOIN Ligands ON Ligands.LigName = R.LigName {unclustered_query}"
-            # get dict of ligands and pose ids passing all filters including substruct
-            lignames_poseids_with_substructs = self._perform_ligand_substruct_filter(
-                query, _lig_filters, position_search
-            )
+            partial_rdkit_query = f" FROM {filtering_window} R JOIN Ligands ON Ligands.LigName = R.LigName {unclustered_query}"
 
+            # get dict of ligands and pose ids passing all filters including substruct
+            lignames_poseids_with_substructs = self._perform_rdkit_filtering(
+                partial_rdkit_query, lig_filters
+            )
             # make one list of all pose_ids passing so far
             passing_pose_ids = []
             for _, poseids in lignames_poseids_with_substructs.items():
@@ -2668,14 +2658,7 @@ class StorageManagerSQLite(StorageManager):
             unclustered_query = " R.Pose_ID IN ({0})".format(
                 ",".join(map(str, passing_pose_ids))
             )
-            if position_search:
-                try:
-                    unclustered_query = self._ligand_substructure_position_filter(
-                        unclustered_query, _lig_filters
-                    )
-                except OptionError as e:
-                    self.logger.warning(str(e))
-                    unclustered_query = " R.Pose_ID=-9999 "
+
             unclustered_query = " WHERE " + unclustered_query
 
         # if clustering is requested, do that before saving view or filtering results for output
@@ -2702,6 +2685,269 @@ class StorageManagerSQLite(StorageManager):
         output_query = query_select_string + query
         view_query = f"SELECT * FROM {filtering_window} R " + query
         return output_query, view_query
+
+    # @profile
+    def _perform_rdkit_filtering(
+        self, partial_query: str, ligand_filters: dict
+    ) -> dict:
+        """Will run a filtering query with regular filters, and perform RDKit 'GetSubstructMatch'
+        for each chosen substructure. The method streams 100 ligands into memory at once from the cursor
+        as it reads from the database, and checks for the substructure(s).
+
+        Args:
+            query (str): partial query string for regular filters, without a SELECT statement
+            ligand_filters (dict): List of filters on ligand table
+
+        Returns:
+            dict: dict of ligand names and all their pose ids passing regular+substruct filters
+        """
+        maxatoms = 0
+        position = False
+        substruct_mols = []
+        rdkit_filters = [
+            "ligand_max_atoms",
+            "ligand_substruct",
+            "ligand_substruct_pos",
+        ]
+        # handle single value filters
+        if "ligand_operator" in ligand_filters:
+            logical_operator = ligand_filters["ligand_operator"]
+        if "ligand_max_atoms" in ligand_filters:
+            maxatoms = ligand_filters["ligand_max_atoms"]
+        # whether or not doing a substruct position filter
+
+        num_of_filters = sum([item in ligand_filters for item in rdkit_filters])
+
+        def _smarts_to_mol(smarts: str) -> str:
+            smarts_mol = Chem.MolFromSmarts(smarts)
+            # make sure SMARTS is valid
+            for atom in smarts_mol.GetAtoms():
+                if atom.GetAtomicNum() == 1:
+                    raise DatabaseQueryError(
+                        f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
+                    )
+            return smarts_mol
+
+        select_statement = "SELECT R.Pose_id, Ligands.LigName, Ligands.Ligand_rdmol "
+        # handle substruct
+        if "ligand_substruct" in ligand_filters:
+            for substruct in ligand_filters["ligand_substruct"]:
+                substruct_mols.append(_smarts_to_mol(substruct))
+        if "ligand_substruct_pos" in ligand_filters:
+            substruct_pos = ligand_filters["ligand_substruct_pos"]
+            position = True
+            # we need additional info if doing position search
+            select_statement += ", Ligands.atom_index_map, R.ligand_coordinates "
+        # build full query
+        query = select_statement + partial_query
+
+        # generator of cursor stream
+        def _stream_query(query: str, batch_size: int = 100):
+            """
+            cursor stream generator
+
+            Args:
+                query (str): sql query
+                batch_size (int): how many cursor hits to read into memory at once
+
+            Yields:
+                cursor batch: cursor results for the query in batch increments, where row can be read
+            """
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+
+            while True:
+                batch = cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                for row in batch:
+                    yield row
+
+        # method to check if substructure in correct position
+        def _substructure_position_calculation(
+            idxmap, ligand_coordinates, smartsmol, filter
+        ) -> bool:
+            """
+            Method that checks whether or not a substructure specified by smarts
+            is present on a ligand in the specified location (by means of the filter values).
+
+            Args:
+                idxmap (dict): index map of the ligand
+                ligand_coordinates (json): ligand coordinates
+                smartsmol (mol): mol object of the smarts pattern
+                filter (list[str]): filter values from user
+
+            Returns:
+                bool: whether or not the smarts in the pose qualified in the right position
+            """
+            # unpack filter values
+            index = filter[0]
+            sqdist = filter[1] ** 2
+            x = filter[2]
+            y = filter[3]
+            z = filter[4]
+
+            xyz = [
+                float(value)
+                for value in json.loads(ligand_coordinates)[idxmap[smartsmol[index]]]
+            ]
+            d2 = (xyz[0] - x) ** 2 + (xyz[1] - y) ** 2 + (xyz[2] - z) ** 2
+            if d2 <= sqdist:
+                return True
+            else:
+                return False
+
+        # method to prepare ligand index map
+        def _ligand_indexmap(atom_index_map):
+            """
+            Method that converts the atom index mapping in the database to one usable by the filter method
+
+            Args:
+                atom_index_map (json): indices of all atoms in the ligand
+
+            Returns:
+                dict: filter ready index map of the ligand
+            """
+            idxmap = [int(value) - 1 for value in json.loads(atom_index_map)]
+
+            return {
+                idxmap[j * 2]: idxmap[j * 2 + 1] for j in range(int(len(idxmap) / 2))
+            }
+
+        filtered_ligands = {}
+
+        for ligandrow in _stream_query(query):
+            # keep track if ligand has passed or failed filter
+            passing = 0
+            # substruct and maxatoms do not discriminate on poses, check if ligand has already been accounted for
+            if not position and ligandrow[0] in filtered_ligands.keys():
+                # append pose_id (ligandrow[0]) to list under ligname ligandrow [1]to keep track of pose ids that passed main query
+                filtered_ligands[ligandrow[1]].append(ligandrow[0])
+                print("Already in the list, added its next pose")
+            # the real workhorse
+            else:
+                # deserialize rdmol
+                ligand_mol = Chem.Mol(ligandrow[2])
+                # check if qualify for maxatoms
+                if maxatoms > 0:
+                    if ligand_mol.GetNumHeavyAtoms() <= maxatoms:
+                        # add ligand and pose_id to filtered_ligands dict
+                        # filtered_ligands[row[1]] = row[0]
+                        passing += 1
+                    else:
+                        # ligand did not pass filter and does not need to be tested further
+                        # continues to the next row in _stream_query loop
+                        continue
+                # if there are substructures in the search
+                if substruct_mols:
+                    """This can all be a function, ran here and for substruct_pos"""
+                    # count how many matches
+                    SMARTS_match = 0
+                    failed = False
+                    # check for each SMARTS if is substruct
+                    for smarts_mol in substruct_mols:
+                        is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
+                        if is_substruct:
+                            # if ligand substruct operator is OR, only one match is needed to qualify the ligand
+                            if logical_operator == "OR":
+                                # count each passing filter
+                                passing += 1
+                                # add ligand to dict with its pose id
+                                # filtered_ligands[row[0]] = [row[2]]
+                                # stop testing this ligand since it just needed one match to pass
+                                # breaks the smarts_mol in substruct_mols loop
+                                break
+                            # logical operator is AND, accumulate each substructure match
+                            else:
+                                SMARTS_match += 1
+                        else:  # if "AND" and more substructs
+                            # ligand failed filter
+                            failed = True
+                            # this will break the smarts_mol in substruct_mols loop
+                            break
+                    # conitinues to the next row in _stream_query loop
+                    if failed:
+                        continue
+                    # at the end, if AND operator, check if ligand matched on all smarts patterns
+                    if logical_operator == "AND" and SMARTS_match == len(
+                        substruct_mols
+                    ):
+                        passing += 1
+                    # filtered_ligands[row[1]] = [row[0]]
+                # should only make it here if the other two filters didn't 'continue' the main for loop
+                if position:
+                    # count how many matches
+                    SMARTS_pos_match = 0
+                    failed = False
+                    # check for each SMARTS if is substruct
+                    for filterrow in substruct_pos:
+                        smarts_mol = _smarts_to_mol(filterrow[0])
+                        ligand_index_map = _ligand_indexmap(ligandrow[3])
+                        ligand_coordinates = ligandrow[4]
+                        substruct_pos_filter = filterrow[1:]
+                        for hit in ligand_mol.GetSubstructMatches(smarts_mol):
+                            filter_match = _substructure_position_calculation(
+                                ligand_index_map,
+                                ligand_coordinates,
+                                hit,
+                                substruct_pos_filter,
+                            )
+                            if filter_match:
+                                if logical_operator == "OR":
+                                    # count each passing filter
+                                    passing += 1
+                                    # add ligand to dict with its pose id
+                                    # filtered_ligands[row[0]] = [row[2]]
+                                # if logical operator is AND, accumulate each substructure match
+                                else:
+                                    print(
+                                        " One passed the filter, but we need all of them"
+                                    )
+                                    SMARTS_pos_match += 1
+                                # breaks for hit in ligand_mol.GetSubstructMatches(smarts_mol)
+                                break
+                            else:
+                                # iterates to the next hit of the substruct in the ligand
+                                continue
+
+                        # if passed_substruct_pos:
+                        #     if logical_operator == "OR":
+                        #         # breaks for filterrow in substruct_pos, because we got our one match, move on to next row/ligand
+                        #         print(
+                        #             "!!!!!!leaving the substruct pos search beacuse we found one and only need one"
+                        #         )
+                        #         break
+                        #     elif logical_operator == "AND":
+                        #         # one more match, test next one
+                        #         SMARTS_pos_match = +1
+                        #         print(
+                        #             "Continuing to the next substruct search because we need all"
+                        #         )
+                        #         print("continuing going through the filters")
+                        #         continue
+                        # else:
+                        #     # ligand failed, moving on to the next one
+                        #     print("testing next ligand")
+                        #     # breaks out of for hit in ligand_mol.GetSubstructMatches(smarts_mol)
+                        #     break
+                    if logical_operator == "AND" and SMARTS_pos_match == len(
+                        substruct_pos
+                    ):
+                        passing += 1
+            # if ligand/ligand and pose id passed all specified rdkit filters
+            print(
+                f"{ligandrow[1]} passed {passing} filters out of {num_of_filters} total."
+            )
+            if passing == num_of_filters:
+                print("Yup this one passed! ")
+                # add ligand to dict with its pose id
+                filtered_ligands[ligandrow[1]] = [ligandrow[0]]
+                # continue to the next one
+                continue
+        print("filtered_ligands", filtered_ligands)
+        return filtered_ligands
+
+    # @profile
 
     def _prepare_cluster_query(self, unclustered_query: str) -> str | None:
         """
@@ -2984,76 +3230,6 @@ class StorageManagerSQLite(StorageManager):
 
         return query
 
-    # @profile
-    def _ligand_substructure_position_filter(
-        self, filtered_poses_query: str, ligand_filters_dict: dict
-    ) -> str:
-        """
-        Method that takes all ligand filters in the presence of a ligand_substruct_pos filter, and reduces the query to
-        " IN (<pose_ids>) " based on what pose_ids passed the ligand filters
-
-        Args:
-            filtered_poses_query (str): sql query string for poses having passed regular filters
-            ligand_filters_dict (dict): all specified ligand filters
-
-        Raises:
-            OptionError
-
-        Returns:
-            str: partial query that identifies pose ids passing the ligand substructure filter
-        """
-        queries = []
-        nr_smarts = len(ligand_filters_dict["ligand_substruct_pos"])
-        # remove temp table if already in session
-        cur = self.conn.cursor()
-        cur.execute("DROP TABLE IF EXISTS passed_smarts")
-
-        # new query that gets the necessary information from the already filtered pose ids
-        query = f"""SELECT R.Pose_ID, L.ligand_smile, L.ligand_rdmol, L.atom_index_map, R.ligand_coordinates 
-        FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE {filtered_poses_query} """
-        query = "CREATE TEMP TABLE passed_smarts AS " + query
-        cur.execute(query)
-
-        smarts_loc_filters = []
-        for i in range(nr_smarts):
-            smarts = ligand_filters_dict["ligand_substruct_pos"][i][0]
-            index = int(ligand_filters_dict["ligand_substruct_pos"][i][1])
-            sqdist = float(ligand_filters_dict["ligand_substruct_pos"][i][2]) ** 2
-            x = float(ligand_filters_dict["ligand_substruct_pos"][i][3])
-            y = float(ligand_filters_dict["ligand_substruct_pos"][i][4])
-            z = float(ligand_filters_dict["ligand_substruct_pos"][i][5])
-            # append processed data to list of filters as a tuple
-            smarts_loc_filters.append((smarts, index, x, y, z))
-            # get all results that passed former filters
-            pre_filtered_results = self._run_query("SELECT * FROM passed_smarts")
-            pose_id_list = []
-            smartsmol = Chem.MolFromSmarts(smarts)
-            # iterate through each unique pose
-            for pose_id, smiles, rdbin, idxmap, coords in pre_filtered_results:
-                mol = Chem.Mol(rdbin)
-                idxmap = [int(value) - 1 for value in json.loads(idxmap)]
-                idxmap = {
-                    idxmap[j * 2]: idxmap[j * 2 + 1]
-                    for j in range(int(len(idxmap) / 2))
-                }
-                for hit in mol.GetSubstructMatches(smartsmol):
-                    xyz = [
-                        float(value) for value in json.loads(coords)[idxmap[hit[index]]]
-                    ]
-                    d2 = (xyz[0] - x) ** 2 + (xyz[1] - y) ** 2 + (xyz[2] - z) ** 2
-                    if d2 <= sqdist:
-                        pose_id_list.append(str(pose_id))
-                        break  # add pose only once
-            if len(pose_id_list) > 0:
-                queries.append(" R.Pose_ID IN ({0}) ".format(",".join(pose_id_list)))
-        cur.close()
-        if not queries:
-            raise OptionError(
-                "There are no ligands passing the 'ligand_substruct_pos' filter, please revise your filter query."
-            )
-
-        return ligand_filters_dict["ligand_operator"].join(queries)
-
     def _generate_interaction_bitvectors(self, pose_ids: str) -> dict:
         """
         Method to generate a dict of generate bitvector strings from pose_ids
@@ -3171,99 +3347,6 @@ class StorageManagerSQLite(StorageManager):
         )
 
         return self._run_query(sql_string).fetchall()
-
-    # @profile
-    def _perform_ligand_substruct_filter(
-        self, query: str, ligand_filters: dict, position_search: bool = False
-    ) -> dict:
-        """Will run a filtering query with regular filters, and perform RDKit 'GetSubstructMatch'
-        for each chosen substructure. The method streams 100 ligands into memory at once from the cursor
-        as it reads from the database, and checks for the substructure(s).
-
-        Args:
-            query (str): query string for regular filters, expected output columns:LigName,ligand_rdmol,Pose_id
-            ligand_filters (dict): List of filters on ligand table
-
-        Returns:
-            dict: dict of ligand names and all their pose ids passing regular+substruct filters
-        """
-
-        if "ligand_operator" in ligand_filters:
-            logical_operator = ligand_filters["ligand_operator"]
-        else:
-            self.logger.info(
-                "A logical operator to combine ligand filters were not provided, will use the default value 'OR'."
-            )
-            logical_operator = "OR"
-
-        # handle substruct
-        if "ligand_substruct" in ligand_filters:
-            # list of smarts converted to mol for filtering
-            smarts_mols = []
-            for smarts in ligand_filters["ligand_substruct"]:
-                smarts_mol = Chem.MolFromSmarts(smarts)
-                # make sure SMARTS is valid
-                for atom in smarts_mol.GetAtoms():
-                    if atom.GetAtomicNum() == 1:
-                        raise DatabaseQueryError(
-                            f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
-                        )
-                smarts_mols.append(smarts_mol)
-
-            # generator of cursor stream
-            def _stream_query(query: str, batch_size: int = 10):
-                """
-                cursor stream generator
-
-                Args:
-                    query (str): sql query
-                    batch_size (int): how many cursor hits to read into memory at once
-
-                Yields:
-                    cursor batch: cursor results for the query in batch increments, where row can be read
-                """
-                cursor = self.conn.cursor()
-                cursor.execute(query)
-
-                while True:
-                    batch = cursor.fetchmany(batch_size)
-                    if not batch:
-                        break
-                    for row in batch:
-                        yield row
-
-            filtered_ligands_with_substructs = {}
-            # read each row in the streamed "batch" of ligands
-            for row in _stream_query(query):
-                # each row will be per pose_id [2], but we are only matching on ligand_smiles [1]
-                # for which there should exist only one per ligname.
-                if row[0] in filtered_ligands_with_substructs.keys():
-                    # append pose id (row[2]) to list under ligname to keep track of pose ids that passed main query
-                    filtered_ligands_with_substructs[row[0]].append(row[2])
-                # if ligname not in dict, it has not been tested yet so proceed with substruct matching
-                else:
-                    # deserialize rdmol
-
-                    ligand_mol = Chem.Mol(row[1])
-                    # count how many matches
-                    SMARTS_match = 0
-                    # check for each SMARTS if is substruct
-                    for smarts_mol in smarts_mols:
-                        is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
-                        if is_substruct:
-                            # if ligand substruct operator is OR, only one match is needed to qualify the ligand
-                            if logical_operator == "OR":
-                                # add ligand to dict with its pose id
-                                filtered_ligands_with_substructs[row[0]] = [row[2]]
-                                # stop testing this ligand since it just needed one match to pass
-                                break
-                            # if logical operator is AND, accumulate each substructure match
-                            else:
-                                SMARTS_match += 1
-                    # if AND operator, check if ligand matched on all smarts patterns
-                    if logical_operator == "AND" and SMARTS_match == len(smarts_mols):
-                        filtered_ligands_with_substructs[row[0]] = [row[2]]
-        return filtered_ligands_with_substructs
 
     def _generate_selective_insert_query(
         self, bookmark1_name, bookmark2_name, select_str, new_db_name, temp_table
