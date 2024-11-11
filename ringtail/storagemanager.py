@@ -2678,22 +2678,38 @@ class StorageManagerSQLite(StorageManager):
 
         output_query = query_select_string + query
         view_query = f"SELECT * FROM {filtering_window} R " + query
+
         return output_query, view_query
 
-    # @profile
     def _perform_rdkit_filtering(
         self, partial_query: str, ligand_filters: dict
     ) -> dict:
-        """Will run a filtering query with regular filters, and perform RDKit 'GetSubstructMatch'
-        for each chosen substructure. The method streams 100 ligands into memory at once from the cursor
-        as it reads from the database, and checks for the substructure(s).
+        """Will run a filtering query with regular filters, then and perform in-memory filtering on
+        whichever of the three RDKit filters substruct, substruct_pos, and maxheavtatoms.
+        The method streams 100 ligands into memory at once from the cursor (while the cursor is
+        still reading if database is big) and performs filtering on the one batch at the time.
+        One row/ligand-pose_id from the stream is evaluated at once, from fastest to slowest filter:
+        First, check if passing max_heavy_atoms filter if specified,
+        Second, check if passing substructure filter if specified (does not account for substruct_pos substructures),
+        Third, check if passing substruct_pos filter if specified
+        Ligand-pose_id will only advance through the queries if it passes prior specified filter.
+        If using logical operator "OR" to combine a set of substructs or substruct_pos', it will only test a ligand-pose_id
+        until it passes one of the given filters, and will not test the remaining filter values for that filter.
+        If a ligand passes a filter where pose is not relevant, it will add all pose_ids for that ligand
+        in the resuling filtered_ligand dict.
+
+        This method has several internal, private methods including
+        _smarts_to_mol: creates mol object of substructure/SMARTS and checks for explicit hydrogens
+        _stream_query: method that "streams" from the database and yields db cursor rows
+        _substructure_position_calculation: checks if a substructure is in the right location
+        _ligand_indexmap: calculates an index map for the ligand.
 
         Args:
-            query (str): partial query string for regular filters, without a SELECT statement
+            partial_query (str): partial query string for regular filters without a SELECT statement
             ligand_filters (dict): List of filters on ligand table
 
         Returns:
-            dict: dict of ligand names and all their pose ids passing regular+substruct filters
+            dict: dict of ligand names and all their pose ids passing regular+rdkit filters
         """
         maxatoms = 0
         position = False
@@ -2712,12 +2728,24 @@ class StorageManagerSQLite(StorageManager):
 
         num_of_filters = sum([item in ligand_filters for item in rdkit_filters])
 
-        def _smarts_to_mol(smarts: str) -> str:
+        def _smarts_to_mol(smarts: str) -> Chem.Mol:
+            """
+            creates a mol object from a smarts pattern if no explicit hydrogens
+
+            Args:
+                smarts (str): substructure smarts to match
+
+            Raises:
+                OptionError
+
+            Returns:
+                Mol: rdkit mol object
+            """
             smarts_mol = Chem.MolFromSmarts(smarts)
             # make sure SMARTS is valid
             for atom in smarts_mol.GetAtoms():
                 if atom.GetAtomicNum() == 1:
-                    raise DatabaseQueryError(
+                    raise OptionError(
                         f"Given ligand substructure filter {smarts} contains explicit hydrogens. Please re-run query with SMARTs without hydrogen."
                     )
             return smarts_mol
@@ -2735,7 +2763,6 @@ class StorageManagerSQLite(StorageManager):
         # build full query
         query = select_statement + partial_query
 
-        # generator of cursor stream
         def _stream_query(query: str, batch_size: int = 100):
             """
             cursor stream generator
@@ -2757,7 +2784,6 @@ class StorageManagerSQLite(StorageManager):
                 for row in batch:
                     yield row
 
-        # method to check if substructure in correct position
         def _substructure_position_calculation(
             idxmap, ligand_coordinates, smartsmol, filter
         ) -> bool:
@@ -2781,18 +2807,19 @@ class StorageManagerSQLite(StorageManager):
             y = filter[3]
             z = filter[4]
 
+            # calculate xyz space coordinates
             xyz = [
                 float(value)
                 for value in json.loads(ligand_coordinates)[idxmap[smartsmol[index]]]
             ]
+            # calculate the sum of squares distances
             d2 = (xyz[0] - x) ** 2 + (xyz[1] - y) ** 2 + (xyz[2] - z) ** 2
             if d2 <= sqdist:
                 return True
             else:
                 return False
 
-        # method to prepare ligand index map
-        def _ligand_indexmap(atom_index_map):
+        def _ligand_indexmap(atom_index_map) -> dict:
             """
             Method that converts the atom index mapping in the database to one usable by the filter method
 
@@ -2892,8 +2919,6 @@ class StorageManagerSQLite(StorageManager):
                     filtered_ligands[ligandrow[1]] = [ligandrow[0]]
 
         return filtered_ligands
-
-    # @profile
 
     def _prepare_cluster_query(self, unclustered_query: str) -> str | None:
         """
