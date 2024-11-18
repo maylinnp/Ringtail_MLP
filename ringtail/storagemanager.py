@@ -2835,11 +2835,9 @@ class StorageManagerSQLite(StorageManager):
                 idxmap[j * 2]: idxmap[j * 2 + 1] for j in range(int(len(idxmap) / 2))
             }
 
+        ligands_checked = 0
         filtered_ligands = {}
-
-        for ligandrow in _stream_query(query):
-            # keeps track of how many filters ligand passed
-            passing = 0
+        for ligandrow in _stream_query(query, 1):
             # substruct and maxatoms do not discriminate on poses, check if ligand has already been accounted for
             if not position and ligandrow[1] in list(filtered_ligands.keys()):
                 # append pose_id (ligandrow[0]) to ligname ligandrow[1] list
@@ -2850,12 +2848,10 @@ class StorageManagerSQLite(StorageManager):
                 ligand_mol = Chem.Mol(ligandrow[2])
                 # check if qualify for maxatoms
                 if maxatoms > 0:
-                    if ligand_mol.GetNumHeavyAtoms() <= maxatoms:
-                        # passed this filter
-                        passing += 1
-                    else:
-                        # ligand did not pass filter, continue to next row/ligand
+                    if not ligand_mol.GetNumHeavyAtoms() <= maxatoms:
+                        # continue for ligandrow in _stream_query, ligand did not pass
                         continue
+
                 # if there are substructures in the search
                 if substruct_mols:
                     # count how many matches
@@ -2864,29 +2860,31 @@ class StorageManagerSQLite(StorageManager):
                     for smarts_mol in substruct_mols:
                         is_substruct = bool(ligand_mol.GetSubstructMatch(smarts_mol))
                         if is_substruct:
+                            SMARTS_match += 1
+                            ligands_checked += 1
                             # if ligand substruct operator is OR, only one match is needed to qualify the ligand
                             if logical_operator == "OR":
-                                # ligand passed
-                                passing += 1
                                 # breaks the smarts_mol in substruct_mols loop
                                 break
-                            # logical operator is AND, accumulate each substructure match
-                            elif logical_operator == "AND":
-                                SMARTS_match += 1
-                    # at the end, if AND operator, check if ligand matched on all smarts patterns
-                    if logical_operator == "AND" and SMARTS_match == len(
-                        substruct_mols
+                    # check if ligand passed enough substruct queries
+                    if (logical_operator == "OR" and SMARTS_match < 1) or (
+                        logical_operator == "AND" and SMARTS_match < len(substruct_mols)
                     ):
-                        passing += 1
-                # should only make it here if the other two filters didn't 'continue' the main for loop
+                        # continue for ligandrow in _stream_query, ligand did not pass
+                        continue
+                # queries with substructure in a certain position
                 if position:
                     # count how many matches
                     SMARTS_pos_match = 0
                     # check for each SMARTS if is substruct
                     for filterrow in substruct_pos:
+                        # filterrow[0] should be the smarts pattern
                         smarts_mol = _smarts_to_mol(filterrow[0])
+                        # ligandrow[3] should be the ligand atom_index_map
                         ligand_index_map = _ligand_indexmap(ligandrow[3])
+                        # ligandrow[4] should be the ligand coordinates
                         ligand_coordinates = ligandrow[4]
+                        # filterrow [1:] should be indices, distance allowance, and coordinates for smarts match
                         substruct_pos_filter = filterrow[1:]
                         for hit in ligand_mol.GetSubstructMatches(smarts_mol):
                             filter_match = _substructure_position_calculation(
@@ -2896,27 +2894,28 @@ class StorageManagerSQLite(StorageManager):
                                 substruct_pos_filter,
                             )
                             if filter_match:
-                                if logical_operator == "OR":
-                                    # count each passing filter
-                                    passing += 1
-                                # if logical operator is AND, accumulate each substructure match
-                                else:
-                                    SMARTS_pos_match += 1
-                                # breaks for hit in ligand_mol.GetSubstructMatches(smarts_mol)
+                                # count each passing filter
+                                SMARTS_pos_match += 1
+                                # break for hit in ligand_mol.GetSubstructMatches
                                 break
-                    # if 'AND', make sure ligand passed all substructure position filters
-                    if logical_operator == "AND" and SMARTS_pos_match == len(
-                        substruct_pos
+                        if logical_operator == "OR" and SMARTS_pos_match <= 1:
+                            # break for filterrow in substruct_pos
+                            break
+                    # check if ligand passed enough substruct queries
+                    if (logical_operator == "OR" and SMARTS_pos_match < 1) or (
+                        logical_operator == "AND"
+                        and SMARTS_pos_match < len(substruct_pos)
                     ):
-                        passing += 1
-            # if ligand/ligand and pose id passed all specified rdkit filters
-            if passing == num_of_filters:
-                # add pose id to list if ligand already in the list
-                if ligandrow[1] in list(filtered_ligands.keys()):
-                    filtered_ligands[ligandrow[1]].append(ligandrow[0])
-                # add new ligand in the list of passing ligands
-                else:
-                    filtered_ligands[ligandrow[1]] = [ligandrow[0]]
+                        # continue for ligandrow in _stream_query, ligand did not pass
+                        continue
+
+            # ligand only makes it here if it passed all specified rdkit filters
+            # add pose id to list if ligand already in the list
+            if ligandrow[1] in list(filtered_ligands.keys()):
+                filtered_ligands[ligandrow[1]].append(ligandrow[0])
+            # add new ligand in the list of passing ligands
+            else:
+                filtered_ligands[ligandrow[1]] = [ligandrow[0]]
 
         return filtered_ligands
 
