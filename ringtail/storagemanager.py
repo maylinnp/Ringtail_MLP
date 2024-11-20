@@ -2127,7 +2127,6 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             pd.DataFrame: dataframe of requested data
         """
-        print("The requested data: ", requested_data)
         if table:
             return pd.read_sql_query(f"SELECT * FROM {requested_data}", self.conn)
         else:
@@ -2714,19 +2713,11 @@ class StorageManagerSQLite(StorageManager):
         maxatoms = 0
         position = False
         substruct_mols = []
-        rdkit_filters = [
-            "ligand_max_atoms",
-            "ligand_substruct",
-            "ligand_substruct_pos",
-        ]
         # handle single value filters
         if "ligand_operator" in ligand_filters:
             logical_operator = ligand_filters["ligand_operator"]
         if "ligand_max_atoms" in ligand_filters:
             maxatoms = ligand_filters["ligand_max_atoms"]
-        # whether or not doing a substruct position filter
-
-        num_of_filters = sum([item in ligand_filters for item in rdkit_filters])
 
         def _smarts_to_mol(smarts: str) -> Chem.Mol:
             """
@@ -2755,6 +2746,7 @@ class StorageManagerSQLite(StorageManager):
         if "ligand_substruct" in ligand_filters:
             for substruct in ligand_filters["ligand_substruct"]:
                 substruct_mols.append(_smarts_to_mol(substruct))
+        # whether or not doing a substruct position filter
         if "ligand_substruct_pos" in ligand_filters:
             substruct_pos = ligand_filters["ligand_substruct_pos"]
             position = True
@@ -2837,7 +2829,7 @@ class StorageManagerSQLite(StorageManager):
 
         ligands_checked = 0
         filtered_ligands = {}
-        for ligandrow in _stream_query(query, 1):
+        for ligandrow in _stream_query(query):
             # substruct and maxatoms do not discriminate on poses, check if ligand has already been accounted for
             if not position and ligandrow[1] in list(filtered_ligands.keys()):
                 # append pose_id (ligandrow[0]) to ligname ligandrow[1] list
@@ -2872,6 +2864,7 @@ class StorageManagerSQLite(StorageManager):
                     ):
                         # continue for ligandrow in _stream_query, ligand did not pass
                         continue
+
                 # queries with substructure in a certain position
                 if position:
                     # count how many matches
@@ -2898,7 +2891,7 @@ class StorageManagerSQLite(StorageManager):
                                 SMARTS_pos_match += 1
                                 # break for hit in ligand_mol.GetSubstructMatches
                                 break
-                        if logical_operator == "OR" and SMARTS_pos_match <= 1:
+                        if logical_operator == "OR" and SMARTS_pos_match == 1:
                             # break for filterrow in substruct_pos
                             break
                     # check if ligand passed enough substruct queries
@@ -2910,8 +2903,10 @@ class StorageManagerSQLite(StorageManager):
                         continue
 
             # ligand only makes it here if it passed all specified rdkit filters
+            self.logger.info(f"Ligand {ligandrow[1]} passed rdkit filters.")
             # add pose id to list if ligand already in the list
             if ligandrow[1] in list(filtered_ligands.keys()):
+
                 filtered_ligands[ligandrow[1]].append(ligandrow[0])
             # add new ligand in the list of passing ligands
             else:
