@@ -50,9 +50,6 @@ dependencies = [
 packages = ["ringtail"]
 package-dir = {"" = "."}
 
-# [tool.setuptools.packages.find]
-# where = ["ringtail"]
-
 [tool.setuptools.package-data]
 "*" = ["README.md","LICENSE","docs/*","test/*"]
 
