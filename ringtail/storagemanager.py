@@ -6,8 +6,8 @@
 
 import sqlite3
 
-# import sqlalchemy
-# from sqlalchemy import text
+import sqlalchemy
+from sqlalchemy import text
 import time
 import json
 import pandas as pd
@@ -34,19 +34,17 @@ from .exceptions import (
     OptionError,
 )
 
-import multiprocess
-
 
 class StorageManager:
 
-    _db_schema_ver = "2.1.1"
+    _db_schema_ver = "2.2.0"
 
     # "db_schema_ver":list("compatible code versions")
     _db_schema_code_compatibility = {
         "1.0.0": ["1.0.0"],
         "1.1.0": ["1.1.0"],
-        "2.0.0": ["2.0.0", "2.1.0"],
-        "2.1.1": ["2.1.1"],
+        "2.0.0": ["2.0.0", "2.1.0", "2.1.1"],
+        "2.2.0": ["2.2.0"],
     }
 
     """Base class for a generic virtual screening database object.

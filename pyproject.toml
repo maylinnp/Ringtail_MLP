@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ringtail"
-version = "2.1.1"
+version = "2.2.0"
 requires-python = ">=3.9"
 authors= [
     {name = "Forli Lab",email="forli@scripps.edu"}
@@ -35,15 +35,6 @@ classifiers=[
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Software Development :: Libraries",
-]
-dependencies = [
-    "meeko",
-    "matplotlib",
-    "rdkit",
-    "scipy",
-    "pandas",
-    "multiprocess",
-    "pandas"
 ]
 
 [tool.setuptools]
