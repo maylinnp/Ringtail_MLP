@@ -1531,7 +1531,7 @@ class StorageManagerSQLite(StorageManager):
             f"{self.bookmark_name}_{cluster_type}_{cluster_cutoff.replace('.', 'p')}"
         )
         if column_name not in ligand_cluster_columns:
-            cur.execute(f"ALTER TABLE Ligand_clusters ADD COLUMN {column_name}")
+            cur.execute("ALTER TABLE Ligand_clusters ADD COLUMN ?", column_name)
         for ci, cl in enumerate(clusters):
             for i in cl:
                 poseid = poseid_list[i]
@@ -1717,7 +1717,7 @@ class StorageManagerSQLite(StorageManager):
         cur = self.conn.cursor()
         # drop old view if there is one
         try:
-            cur.execute(f"DROP VIEW IF EXISTS {name}")
+            cur.execute("DROP VIEW IF EXISTS ?", name)
             cur.execute(query)
             cur.close()
         except sqlite3.OperationalError as e:
@@ -2222,7 +2222,7 @@ class StorageManagerSQLite(StorageManager):
             bookmark_name = self.current_bookmark_name
         try:
             cur = self.conn.cursor()
-            cur.execute(f"SELECT COUNT(DISTINCT LigName) FROM {bookmark_name}")
+            cur.execute("SELECT COUNT(DISTINCT LigName) FROM ?", bookmark_name)
             n_ligands = int(cur.fetchone()[0])
             cur.close()
             return n_ligands
@@ -3426,7 +3426,7 @@ class StorageManagerSQLite(StorageManager):
             rtdb_version = db_version.replace(".", "")
             # if so, proceed to set db schema version
             cur = self.conn.cursor()
-            cur.execute(f"PRAGMA user_version = {rtdb_version}")
+            cur.execute("PRAGMA user_version = ?", rtdb_version)
             self.conn.commit()
             cur.close()
             self.logger.info("Database version set to {0}".format(rtdb_version))
@@ -3494,7 +3494,7 @@ class StorageManagerSQLite(StorageManager):
             "SELECT name FROM sqlite_master WHERE type = 'view'"
         ).fetchall()
         for v in views:
-            cur.execute(f"DROP VIEW IF EXISTS {v[0]}")
+            cur.execute("DROP VIEW IF EXISTS ?", v[0])
         # delete all rows in bookmarks table
         cur.execute("DELETE FROM Bookmarks")
 
