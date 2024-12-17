@@ -1584,7 +1584,7 @@ class RingtailCore:
                 # if not, raise error
                 else:
                     raise StorageError(
-                        "Filtering bookmark {0} does not exist in database. Cannot write passing molecule SDFs".format(
+                        "Filtering bookmark {0} does not exist in database, possibly because no ligands passed the specified filters. Cannot create passing molecule rdkit objects".format(
                             self.storageman.bookmark_name
                         )
                     )
