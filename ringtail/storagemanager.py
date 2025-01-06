@@ -9,6 +9,7 @@ import sqlite3
 import sqlalchemy
 from sqlalchemy import text
 import time
+import os
 import json
 import pandas as pd
 from .logutils import LOGGER as logger
@@ -43,7 +44,7 @@ class StorageManager:
     _db_schema_code_compatibility = {
         "1.0.0": ["1.0.0"],
         "1.1.0": ["1.1.0"],
-        "2.0.0": ["2.0.0", "2.1.0", "2.1.1"],
+        "2.0.0": ["2.0.0", "2.1.0", "2.1.1", "2.2.0"],
         "2.2.0": ["2.2.0"],
     }
 
@@ -351,13 +352,15 @@ class StorageManager:
 
         return temp_name, num_passing
 
-    def prune(self):
+    def prune_nonpassing(self):
         """Deletes rows from results, ligands, and interactions in a bookmark
         if they do not pass filtering criteria
         """
         self._delete_from_results()
         self._delete_from_ligands()
         self._delete_from_interactions_not_in_view()
+        # TODO this should check to make sure only relevant interaction indices are present in interaction_indices table
+        # should remove bookmarks, retain db_properties
 
     # endregion
 
@@ -1572,7 +1575,7 @@ class StorageManagerSQLite(StorageManager):
         except sqlite3.OperationalError as e:
             raise StorageError("Error occurred while indexing") from e
 
-    def _delete_table(self, table_name: str):
+    def _delete_table(self, table_name: str, db_alias: str = None):
         """
         Method to delete a table
 
@@ -1580,8 +1583,36 @@ class StorageManagerSQLite(StorageManager):
             table_name (str): table to be dropped
 
         """
-        query = f"""DROP TABLE IF EXISTS {table_name};"""
+
+        if db_alias:
+            alias_str = db_alias + "."
+        else:
+            alias_str = None
+        query = f"""DROP TABLE IF EXISTS {alias_str}{table_name};"""
         return self._run_query(query)
+
+    def create_merge_tables(self) -> str:
+        try:
+            cur = self.conn.cursor()
+            # create mergedata table: merge_id (PK), dbfile, timestamp, numofrows table
+            mergetbl_sql = """CREATE TABLE IF NOT EXISTS merged_tables (
+            merge_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            dbfile                  VARCHAR[],
+            merge_start             DATETIME DEFAULT CURRENT_TIMESTAMP);"""
+            cur.execute(mergetbl_sql)
+
+            # create PK table: merge_id(FK), table, original_val, merge_val
+            pktable_sql = """CREATE TABLE IF NOT EXISTS PK_conversions (
+            merge_id        INTEGER,
+            table_name      VARCHAR[],
+            original_PK     INTEGER,
+            merged_PK       INTEGER,
+            FOREIGN KEY(merge_id) REFERENCES merged_tables(merge_id));"""
+            cur.execute(pktable_sql)
+            self.conn.commit()
+            return "success"
+        except Exception as e:
+            raise StorageError(e)
 
     # endregion
 
@@ -2938,7 +2969,9 @@ class StorageManagerSQLite(StorageManager):
                 fps (): fingerprints
                 cutoff distance (float)
             """
+            from rdkit.SimDivFilters import rdSimDivPickers
 
+            lp = rdSimDivPickers.LeaderPicker()
             # first generate the distance matrix:
             dists = []
             nfps = len(fps)
@@ -2947,6 +2980,10 @@ class StorageManagerSQLite(StorageManager):
                 sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[:i])
                 dists.extend([1 - x for x in sims])
 
+            picks = lp.LazyBitVectorPick(fps, nfps, 0.5)
+            print("Length of picks: ", len(picks))
+            pickfps = [fps[x] for x in picks]
+            print(len(pickfps))
             # now cluster the data:
             cs = Butina.ClusterData(dists, nfps, cutoff, isDistData=True)
             return cs
@@ -3330,6 +3367,7 @@ class StorageManagerSQLite(StorageManager):
             StorageError
         """
         try:
+            # TODO pull in changes from release branch
             self.conn = self._create_connection()
             signal(
                 SIGINT, self._sigint_handler
@@ -3413,8 +3451,17 @@ class StorageManagerSQLite(StorageManager):
         with bck:
             self.conn.backup(bck, pages=1)
         bck.close()
+        self.logger.info(f"Database {self.db_file} was backed up to {backup_name}.")
 
-    def _set_ringtail_db_schema_version(self, db_version: str = "2.0.0"):
+    def _check_if_db_is_compatible(self, attached_db: str, min_version: int) -> bool:
+        main_version = self.conn.execute("""PRAGMA user_version;""").fetchone()[0]
+        attached_version = self.conn.execute(
+            f"""PRAGMA {attached_db}.user_version;"""
+        ).fetchone()[0]
+
+        return main_version == attached_version >= min_version
+
+    def _set_ringtail_db_schema_version(self, db_version: str = "2.1.0"):
         """Will check current stoarge manager db schema version and only set if it is compatible with the code base version (i.e., version(ringtail)).
 
         Raises:
@@ -3463,6 +3510,60 @@ class StorageManagerSQLite(StorageManager):
         cur.close()
         return is_compatible, db_version
 
+    def merge_databases(self, merging_db: str, backup_main_db: bool = True):
+        # back up main database
+        if backup_main_db:
+            self.clone()
+        # attach incoming database and check compatibility
+        merging_db_alias = "merging"
+        self._attach_db(merging_db, merging_db_alias)
+        if not self._check_if_db_is_compatible(merging_db_alias, 210):
+            raise StorageError(
+                "Trying to merge to databases of incompatible versions, cannot proceed."
+            )
+        # create new tables to keep track of merger
+        self.create_merge_tables()
+        # add to merging table the absolute path
+        mergedb_abspath = str(os.path.abspath(merging_db))
+        # insert merging db name first
+        cur = self.conn.execute(
+            """INSERT INTO merged_tables(dbfile) VALUES (?)""",
+            (mergedb_abspath,),
+        )
+        # receptor compatibility check
+        receptorcheck_sql = """
+        SELECT CASE 
+            WHEN Receptors.RecName = merging_receptors.RecName THEN 'True'
+            ELSE 'False'
+        END AS comparison_result 
+        FROM Receptors 
+        JOIN merging.Receptors AS merging_receptors 
+            ON Receptors.receptor_id = merging_receptors.receptor_id"""
+
+        try:
+            assert cur.execute(receptorcheck_sql).fetchone()[0] == "True"
+        except AssertionError:
+            raise StorageError(
+                f"The receptors in the merging databases are not the same. \nThese databases cannot be merged."
+            )
+        else:
+            self.logger.info(
+                "The two databases are of compatible version and receptors. Merging will proceed."
+            )
+
+        # get the active merge_id to ensure we use the correct merge data moving forward
+        merge_id = cur.execute(
+            "SELECT last_insert_rowid() FROM merged_tables"
+        ).fetchone()[0]
+
+        # delete incompatible tables
+        # for main db
+        self._drop_views()
+        self._delete_table("Ligand_clusters")
+        # for attached db
+        self._drop_views(merging_db_alias)
+        self._delete_table("Ligand_clusters", merging_db_alias)
+
     def update_database_version(self, new_version, consent=False):
         """method that updates sqlite database schema 1.0.0 or 1.1.0 to 1.1.0 or 2.0.0
 
@@ -3488,15 +3589,9 @@ class StorageManagerSQLite(StorageManager):
             self.logger.critical("Consent not given for database update. Cancelling...")
             sys.exit(1)
 
-        # get views and drop them
+        # drop views
         self.logger.info(f"Updating {self.db_file}...")
-        views = cur.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'view'"
-        ).fetchall()
-        for v in views:
-            cur.execute(f"DROP VIEW IF EXISTS {v[0]}")
-        # delete all rows in bookmarks table
-        cur.execute("DELETE FROM Bookmarks")
+        self._drop_views()
 
         # if current version is 1.0.0
         if self.check_ringtaildb_version()[1] == "1.0.0":
@@ -3581,6 +3676,19 @@ class StorageManagerSQLite(StorageManager):
                 f"Error while setting the database schema version: {e}"
             ) from e
 
+    def _drop_views(self, db_alias: str = None):
+        if db_alias:
+            alias_string = db_alias + "."
+        else:
+            alias_string = None
+        query = f"SELECT name FROM {alias_string}sqlite_master WHERE type = 'view'"
+        cur = self.conn.execute(query)
+        views = cur.fetchall()
+        for v in views:
+            cur.execute(f"DROP VIEW IF EXISTS {alias_string}{v[0]}")
+        # delete all rows in bookmarks table
+        cur.execute(f"DELETE FROM {alias_string}Bookmarks")
+
     def _create_connection(self):
         """Creates database connection to self.db_file
 
@@ -3643,7 +3751,7 @@ class StorageManagerSQLite(StorageManager):
         except sqlite3.OperationalError as e:
             raise DatabaseInsertionError(f"Error while vacuuming DB") from e
 
-    def _attach_db(self, new_db, new_db_name):
+    def _attach_db(self, new_db, new_db_alias):
         """Attaches new database file to current database
 
         Args:
@@ -3653,7 +3761,7 @@ class StorageManagerSQLite(StorageManager):
         Raises:
             StorageError
         """
-        attach_str = f"ATTACH DATABASE '{new_db}' AS {new_db_name}"
+        attach_str = f"ATTACH DATABASE '{new_db}' AS {new_db_alias}"
 
         try:
             cur = self.conn.cursor()
@@ -3662,8 +3770,10 @@ class StorageManagerSQLite(StorageManager):
             cur.close()
         except sqlite3.OperationalError as e:
             raise StorageError(f"Error occurred while attaching {new_db}") from e
+        else:
+            self.logger.info(f"Attached database {new_db} aliased as {new_db_alias}.")
 
-    def _detach_db(self, new_db_name):
+    def _detach_db(self, new_db_alias):
         """Detaches new database file from current database
 
         Args:
@@ -3672,7 +3782,7 @@ class StorageManagerSQLite(StorageManager):
         Raises:
             StorageError
         """
-        detach_str = f"DETACH DATABASE {new_db_name}"
+        detach_str = f"DETACH DATABASE {new_db_alias}"
 
         try:
             cur = self.conn.cursor()
@@ -3680,7 +3790,9 @@ class StorageManagerSQLite(StorageManager):
             self.conn.commit()
             cur.close()
         except sqlite3.OperationalError as e:
-            raise StorageError(f"Error occurred while detaching {new_db_name}") from e
+            raise StorageError(f"Error occurred while detaching {new_db_alias}") from e
+        else:
+            self.logger.info(f"Detached database aliased as {new_db_alias}.")
 
     def _drop_existing_tables(self):
         """drop any existing tables.
