@@ -25,6 +25,7 @@ from .ringtailoptions import Filters
 from .util import numlist2str
 from .exceptions import (
     StorageError,
+    MergeError,
     DatabaseInsertionError,
     DatabaseConnectionError,
     DatabaseTableCreationError,
@@ -311,6 +312,7 @@ class StorageManager:
         selection_type="-",
         old_db=None,
     ) -> tuple:
+        # TODO can clean this method with new aliasing method
         """Selects ligands found or not found in the given bookmark in both current db and new_db. Stores as temp view
 
         Args:
@@ -1610,9 +1612,8 @@ class StorageManagerSQLite(StorageManager):
             FOREIGN KEY(merge_id) REFERENCES merged_tables(merge_id));"""
             cur.execute(pktable_sql)
             self.conn.commit()
-            return "success"
         except Exception as e:
-            raise StorageError(e)
+            raise StorageError(e) from e
 
     # endregion
 
@@ -3510,16 +3511,15 @@ class StorageManagerSQLite(StorageManager):
         cur.close()
         return is_compatible, db_version
 
-    def merge_databases(self, merging_db: str, backup_main_db: bool = True):
+    def merge_databases(self, merging_db: str, backup: bool = True):
         # back up main database
-        if backup_main_db:
+        if backup:
             self.clone()
         # attach incoming database and check compatibility
-        merging_db_alias = "merging"
-        self._attach_db(merging_db, merging_db_alias)
-        if not self._check_if_db_is_compatible(merging_db_alias, 210):
+        merging_db_alias = self._attach_db(merging_db, "merging")
+        if not self._check_if_db_is_compatible(merging_db_alias, 200):
             raise StorageError(
-                "Trying to merge to databases of incompatible versions, cannot proceed."
+                "Trying to merge two databases of incompatible or too old versions, cannot proceed."
             )
         # create new tables to keep track of merger
         self.create_merge_tables()
@@ -3541,7 +3541,7 @@ class StorageManagerSQLite(StorageManager):
             ON Receptors.receptor_id = merging_receptors.receptor_id"""
 
         try:
-            assert cur.execute(receptorcheck_sql).fetchone()[0] == "True"
+            assert self._run_query(receptorcheck_sql).fetchone()[0] == "True"
         except AssertionError:
             raise StorageError(
                 f"The receptors in the merging databases are not the same. \nThese databases cannot be merged."
@@ -3552,7 +3552,7 @@ class StorageManagerSQLite(StorageManager):
             )
 
         # get the active merge_id to ensure we use the correct merge data moving forward
-        merge_id = cur.execute(
+        merge_id = self._run_query(
             "SELECT last_insert_rowid() FROM merged_tables"
         ).fetchone()[0]
 
@@ -3563,6 +3563,262 @@ class StorageManagerSQLite(StorageManager):
         # for attached db
         self._drop_views(merging_db_alias)
         self._delete_table("Ligand_clusters", merging_db_alias)
+
+        # merge tables
+        try:
+            self._merge_db_properties_table(merge_id)
+            self.logger.info("The 'db_properties' table has been merged.")
+
+            self._merge_ligands_table()
+            self.logger.info("The 'Ligands' table has been merged.")
+
+            self._merge_results_table(merge_id)
+            self.logger.info("The 'Results' table has been merged.")
+
+            self._merge_interaction_tables(merge_id)
+            self.logger.info(
+                "The 'Interaction_indices' and 'Interactions' tables have been merged."
+            )
+            # self._detach_db(merging_db_alias)
+        except Exception as e:
+            raise MergeError(f"Error during database merging: {e}") from e
+        else:
+            self.logger.info(
+                f"The database {merging_db} has been successfully merged into {self.db_file}."
+            )
+        finally:
+            cur.close()
+
+    def _merge_interaction_tables(self, merge_id):
+        # Interaction definitions are unique and results independent, so we only insert those that are new with updated PK,
+        # and assign existing interaction_ids to those already described in primary db
+        convert_ii_sql = """INSERT INTO PK_conversions (
+        merge_id,
+        table_name,
+        original_PK,
+        merged_PK) SELECT 
+        ?,
+        "Interaction_indices", 
+        interaction_id,
+            CASE 
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM Interaction_indices
+                    WHERE 
+                        merging.Interaction_indices.interaction_type = Interaction_indices.interaction_type
+                        AND merging.Interaction_indices.rec_chain = Interaction_indices.rec_chain
+                        AND merging.Interaction_indices.rec_resname = Interaction_indices.rec_resname
+                        AND merging.Interaction_indices.rec_resid = Interaction_indices.rec_resid
+                        AND merging.Interaction_indices.rec_atom = Interaction_indices.rec_atom
+                        AND merging.Interaction_indices.rec_atomid = Interaction_indices.rec_atomid
+                    ) 
+                THEN (
+                    SELECT main.Interaction_indices.interaction_id
+                    FROM main.Interaction_indices
+                    WHERE 
+                        merging.Interaction_indices.interaction_type = Interaction_indices.interaction_type
+                        AND merging.Interaction_indices.rec_chain = Interaction_indices.rec_chain
+                        AND merging.Interaction_indices.rec_resname = Interaction_indices.rec_resname
+                        AND merging.Interaction_indices.rec_resid = Interaction_indices.rec_resid
+                        AND merging.Interaction_indices.rec_atom = Interaction_indices.rec_atom
+                        AND merging.Interaction_indices.rec_atomid = Interaction_indices.rec_atomid
+                    )
+                ELSE merging.Interaction_indices.interaction_id + (SELECT MAX(interaction_id) FROM Interaction_indices)
+            END AS new_interaction_id
+        FROM merging.Interaction_indices;"""
+
+        # then inserting only those that aren't already in the table
+        insert_interaction_indices = """INSERT INTO Interaction_indices (
+        interaction_id,
+        interaction_type,
+        rec_chain,
+        rec_resname,
+        rec_resid,
+        rec_atom,
+        rec_atomid)
+        SELECT 
+            (SELECT merged_PK FROM PK_conversions WHERE original_PK = interaction_id and merge_id = ? AND table_name = 'Interaction_indices') new_id,
+            interaction_type,
+            rec_chain,
+            rec_resname,
+            rec_resid,
+            rec_atom,
+            rec_atomid
+        FROM merging.Interaction_indices WHERE new_id > (SELECT MAX(interaction_id) FROM Interaction_indices);
+        """
+
+        # Adding new data to Interactions table with (updated) pose_id and interaction_id
+        insert_interactions = """
+        INSERT INTO Interactions (
+        Pose_ID,
+        interaction_id
+        ) SELECT
+            (SELECT merged_PK FROM PK_conversions WHERE original_PK = Pose_ID and merge_id = ? and table_name = 'Results'),
+            (SELECT merged_PK FROM PK_conversions WHERE original_PK = interaction_id and merge_id = ? and table_name = 'Interaction_indices')
+        FROM merging.Interactions;"""
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                convert_ii_sql,
+                (merge_id,),
+            )
+            cur.execute(insert_interaction_indices, (merge_id,))
+            cur.execute(
+                insert_interactions,
+                (
+                    merge_id,
+                    merge_id,
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            raise Exception(
+                f"Error during update and insertion of interactions: {e}"
+            ) from e
+
+    def _merge_results_table(self, merge_id):
+
+        cur = self.conn.cursor()
+        convert_poseid_sql = """INSERT INTO PK_conversions (
+        merge_id,
+        table_name,
+        original_PK,
+        merged_PK) SELECT 
+        ?,
+        "Results", 
+        Pose_ID,
+        Pose_ID + (SELECT MAX(Pose_ID) FROM Results) 
+        FROM merging.Results;"""
+
+        # insert results with updated pose_ids
+        insert_Results = """INSERT INTO Results (
+            Pose_ID,
+            LigName,
+            receptor,
+            pose_rank,
+            run_number,
+            docking_score,
+            leff,
+            deltas,
+            cluster_rmsd,
+            cluster_size,
+            reference_rmsd,
+            energies_inter,
+            energies_vdw,
+            energies_electro,
+            energies_flexLig,
+            energies_flexLR,
+            energies_intra,
+            energies_torsional,
+            unbound_energy,
+            nr_interactions,
+            num_hb,
+            about_x,
+            about_y,
+            about_z,
+            trans_x,
+            trans_y,
+            trans_z,
+            axisangle_x,
+            axisangle_y,
+            axisangle_z,
+            axisangle_w,
+            dihedrals,
+            ligand_coordinates,
+            flexible_res_coordinates) 
+            SELECT 
+            (SELECT merged_PK FROM PK_conversions WHERE original_PK = Pose_ID and merge_id = ? and table_name = 'Results'),
+            LigName,
+            receptor,
+            pose_rank,
+            run_number,
+            docking_score,
+            leff,
+            deltas,
+            cluster_rmsd,
+            cluster_size,
+            reference_rmsd,
+            energies_inter,
+            energies_vdw,
+            energies_electro,
+            energies_flexLig,
+            energies_flexLR,
+            energies_intra,
+            energies_torsional,
+            unbound_energy,
+            nr_interactions,
+            num_hb,
+            about_x,
+            about_y,
+            about_z,
+            trans_x,
+            trans_y,
+            trans_z,
+            axisangle_x,
+            axisangle_y,
+            axisangle_z,
+            axisangle_w,
+            dihedrals,
+            ligand_coordinates,
+            flexible_res_coordinates
+        FROM merging.Results;"""
+
+        try:
+            cur.execute(
+                convert_poseid_sql,
+                (merge_id,),
+            )
+            cur.execute(insert_Results, (merge_id,))
+            # commit after each large table in case there are memory constraints
+            self.conn.commit()
+        except Exception as e:
+            raise StorageError(f"Error during insertion of results: {e}") from e
+
+    def _merge_ligands_table(self):
+        try:
+            cur = self.conn.cursor()
+            # Ligand table has unique constraints and primary key is LigName so no checks needed
+            merge_ligands = """INSERT INTO Ligands 
+                SELECT * FROM merging.Ligands"""
+            cur.execute(merge_ligands)
+            self.conn.commit()
+        except Exception as e:
+            raise StorageError("Error encountered while merging Ligands table") from e
+
+    def _merge_db_properties_table(self, merge_id):
+        try:
+            cur = self.conn.cursor()
+            convert_dbprop_sql = """INSERT INTO PK_conversions (
+                merge_id,
+                table_name,
+                original_PK,
+                merged_PK) SELECT 
+                ?,
+                "db_properties", 
+                DB_write_session,
+                DB_write_session + (SELECT MAX(DB_write_session) FROM db_properties) 
+                FROM merging.db_properties;"""
+            cur.execute(
+                convert_dbprop_sql,
+                (merge_id,),
+            )
+
+            insert_dbprops_sql = """INSERT INTO DB_properties (
+                DB_write_session,
+                docking_mode,
+                number_of_poses)
+                SELECT 
+                    (SELECT merged_PK FROM PK_conversions WHERE original_PK = DB_write_session and merge_id = ? and table_name = 'DB_properties'),
+                    docking_mode,
+                    number_of_poses
+                FROM merging.DB_properties;"""
+            cur.execute(insert_dbprops_sql, (merge_id,))
+            self.conn.commit()
+        except Exception as e:
+            raise StorageError(
+                "Error encountered while merging db_properties table"
+            ) from e
 
     def update_database_version(self, new_version, consent=False):
         """method that updates sqlite database schema 1.0.0 or 1.1.0 to 1.1.0 or 2.0.0
@@ -3680,7 +3936,7 @@ class StorageManagerSQLite(StorageManager):
         if db_alias:
             alias_string = db_alias + "."
         else:
-            alias_string = None
+            alias_string = ""
         query = f"SELECT name FROM {alias_string}sqlite_master WHERE type = 'view'"
         cur = self.conn.execute(query)
         views = cur.fetchall()
@@ -3751,7 +4007,7 @@ class StorageManagerSQLite(StorageManager):
         except sqlite3.OperationalError as e:
             raise DatabaseInsertionError(f"Error while vacuuming DB") from e
 
-    def _attach_db(self, new_db, new_db_alias):
+    def _attach_db(self, new_db: str, new_db_alias: str = "attached_db") -> str:
         """Attaches new database file to current database
 
         Args:
@@ -3772,6 +4028,7 @@ class StorageManagerSQLite(StorageManager):
             raise StorageError(f"Error occurred while attaching {new_db}") from e
         else:
             self.logger.info(f"Attached database {new_db} aliased as {new_db_alias}.")
+            return new_db_alias
 
     def _detach_db(self, new_db_alias):
         """Detaches new database file from current database
@@ -3783,7 +4040,7 @@ class StorageManagerSQLite(StorageManager):
             StorageError
         """
         detach_str = f"DETACH DATABASE {new_db_alias}"
-
+        print(detach_str)
         try:
             cur = self.conn.cursor()
             cur.execute(detach_str)

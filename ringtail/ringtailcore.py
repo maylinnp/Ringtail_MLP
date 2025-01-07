@@ -1837,6 +1837,15 @@ class RingtailCore:
 
         return bookmark_db_name
 
+    def merge_databases(self, merging_db: str, backup: bool = True):
+
+        self.logger.warning(
+            "If you have performed clustering, this data will be lost in the new, merged database. "
+        )
+        # create merge tables
+        with self.storageman as sm:
+            sm.merge_databases(**{"merging_db": merging_db, "backup": backup})
+
     def export_receptors(self):
         """
         Export receptor in database to pdbqt
