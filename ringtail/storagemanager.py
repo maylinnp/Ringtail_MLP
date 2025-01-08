@@ -3652,10 +3652,16 @@ class StorageManagerSQLite(StorageManager):
         INSERT INTO Interactions (
         Pose_ID,
         interaction_id
-        ) SELECT
-            (SELECT merged_PK FROM PK_conversions WHERE original_PK = Pose_ID and merge_id = ? and table_name = 'Results'),
-            (SELECT merged_PK FROM PK_conversions WHERE original_PK = interaction_id and merge_id = ? and table_name = 'Interaction_indices')
-        FROM merging.Interactions;"""
+        )    SELECT P.merged_pk as pose_id, II.merged_pk as interaction_id
+                FROM merging.Interactions I
+                LEFT JOIN (SELECT original_PK, merged_pk
+                FROM PK_conversions
+                WHERE table_name = 'Results' 
+                AND merge_id = ?) P ON (I.Pose_ID = P.original_PK)
+            LEFT JOIN (SELECT original_PK, merged_pk
+                FROM PK_conversions
+                WHERE table_name = 'Interaction_indices' 
+                AND merge_id = ?)  II ON (I.Interaction_ID = II.original_PK);"""
 
         try:
             cur = self.conn.cursor()
