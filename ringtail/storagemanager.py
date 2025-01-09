@@ -1611,6 +1611,9 @@ class StorageManagerSQLite(StorageManager):
             merged_PK       INTEGER,
             FOREIGN KEY(merge_id) REFERENCES merged_tables(merge_id));"""
             cur.execute(pktable_sql)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ak_merge ON PK_conversions(merge_id, original_PK)"
+            )
             self.conn.commit()
         except Exception as e:
             raise StorageError(e) from e
