@@ -115,8 +115,15 @@ class StorageManager:
         Returns:
             instance: of class with closed database connection
         """
+        # if open connection, close it
+        if self.conn:
+            # if exiting with error, roll back to latest commit
+            self._close_connection(rollback=bool(exc_type))
+
+        # TODO is the close storage with vacuum and detach db necessary
         if not self.closed_connection:
             self.close_storage()
+
         if exc_type:
             if exc_type == Exception:
                 self.logger.error(str(exc_value))
@@ -149,8 +156,6 @@ class StorageManager:
         """
         if attached_db is not None:
             self._detach_db(attached_db)
-        # close any open cursors
-        self._close_open_cursors()
         # vacuum database
         if vacuum:
             self._vacuum()
@@ -454,8 +459,6 @@ class StorageManagerSQLite(StorageManager):
 
     Attributes:
         conn (SQLite.conn): Connection to database
-        open_cursors (list): list of cursors that were not closed by the function that created them.
-            Will be closed by close_connection method.
         db_file (str): database name
         overwrite (bool): switch to overwrite database if it exists
         order_results (str): what column name will be used to order results once read
@@ -508,7 +511,6 @@ class StorageManagerSQLite(StorageManager):
         }
         self.view_suffix = None
         self.temptable_suffix = 0
-        self.open_cursors = []
 
     # region Methods for inserting into/removing from the database
     def _create_tables(self):
@@ -3984,15 +3986,6 @@ class StorageManagerSQLite(StorageManager):
         self.logger.info("Closing database")
         self.conn.close()
 
-    def _close_open_cursors(self):
-        """closes any cursors stored in self.open_cursors.
-        Resets self.open_cursors to empty list
-        """
-        for cur in self.open_cursors:
-            cur.close()
-
-        self.open_cursors = []
-
     def _db_empty(self):
         """empty database, for example if overwrite
 
@@ -4121,7 +4114,6 @@ class StorageManagerSQLite(StorageManager):
         try:
             cur = self.conn.cursor()
             cur.execute(query)
-            self.open_cursors.append(cur)
         except sqlite3.OperationalError as e:
             raise DatabaseQueryError(
                 "Unable to execute query {0}: {1}".format(query, e)
@@ -4162,7 +4154,10 @@ class StorageManagerSQLAlchemy(StorageManager):
             return self
 
     def __exit__(self, exc_type, exc_value, tb):
-        # close connection?
+
+        # if exiting with error, roll back
+        self._close_connection(rollback=bool(exc_type))
+
         if exc_type:
             if exc_type == Exception:
                 print("There was an error during database operations: ", str(exc_value))
