@@ -221,7 +221,9 @@ class StorageManager:
     # endregion
 
     # region read data
-    def filter_results(self, all_filters: dict, suppress_output=False) -> iter:
+    def filter_results(
+        self, all_filters: dict, clustering=False, suppress_output=False
+    ) -> iter:
         """Generate and execute database queries from given filters.
 
         Args:
@@ -243,7 +245,7 @@ class StorageManager:
             )
         # create view of passing results
         filter_results_str, view_query = self._generate_result_filtering_query(
-            all_filters
+            all_filters, clustering
         )
         self.logger.debug(f"Query for filtering results: {filter_results_str}")
 
@@ -465,8 +467,6 @@ class StorageManagerSQLite(StorageManager):
         outfields (str): data fields/columns to include when reading and outputting data
         filter_bookmark (str): name of bookmark that filtering will be performed over
         output_all_poses (bool): whether or not to output all poses of a ligand
-        mfpt_cluster (float): distance in ångströms to cluster ligands based on morgan fingerprints
-        interaction_cluster (float): distance in ångströms to cluster ligands based on interactions
         bookmark_name (str): name of current bookmark being written to or read from
         duplicate_handling (str): optional attribute to deal with insertion of ligands already in the database
 
@@ -486,8 +486,6 @@ class StorageManagerSQLite(StorageManager):
         outfields: str = None,
         filter_bookmark: str = None,
         output_all_poses: bool = None,
-        mfpt_cluster: float = None,
-        interaction_cluster: float = None,
         bookmark_name: str = None,
         duplicate_handling: str = None,
     ):
@@ -496,24 +494,17 @@ class StorageManagerSQLite(StorageManager):
         self.order_results = order_results
         self.outfields = outfields
         self.output_all_poses = output_all_poses
-        self.mfpt_cluster = mfpt_cluster
-        self.interaction_cluster = interaction_cluster
-        self.filter_bookmark = filter_bookmark
+        self.filter_bookmark = filter_bookmark  # TODO only used in generate filtering query to rename filtering window, optional input
         self.bookmark_name = bookmark_name
-        self.duplicate_handling = duplicate_handling
+        self.duplicate_handling = duplicate_handling  # TODO only in two methods: insert results and insert interaction row, does not have to be class varialble
         super().__init__()
 
-        self.energy_filter_sqlite_call_dict = {
-            "eworst": "docking_score < {value}",
-            "ebest": "docking_score > {value}",
-            "leworst": "leff < {value}",
-            "lebest": "leff > {value}",
-        }
-        self.view_suffix = None
-        self.temptable_suffix = 0
+        self.view_suffix = None  # TODO should be depreceated
+        self.temptable_suffix = 0  # TODO should be depreceated
 
     # region Methods for inserting into/removing from the database
     def _create_tables(self):
+        # TODO should be in main class
         """
         Creates all tables needed for a Ringtail database of a specific version
         """
@@ -2436,7 +2427,20 @@ class StorageManagerSQLite(StorageManager):
                 )
         return [self.field_to_column_name[field] for field in outfields_list]
 
+    def _add_to_filter_object(
+        self,
+        filterobject: list,
+        column: str,
+        operator: str,
+        value: str | None | float | int | iter,
+    ):
+        return filterobject.append(
+            {"column": column, "operator": operator, "value": value}
+        )
+
     def _process_filters_for_query(self, filters_dict: dict):
+        from querybuilder import Filters as queryfilters
+
         # NOTE this method can maybe be a main class method once we get more database types
         """
         Method that reformats the filters to the specified database columns, handles less than/more than filters, etc
@@ -2450,57 +2454,76 @@ class StorageManagerSQLite(StorageManager):
         """
         # write energy filters and compile list of interactions to search for
         numerical_filters = []
+        numerical_filters_NEW = queryfilters()
         interaction_filters = []
         ligand_filters = {}
-        energy_filter_col_name = {
-            "eworst": "docking_score",
-            "ebest": "docking_score",
-            "leworst": "leff",
-            "lebest": "leff",
+        numfilter_to_column = {
             "score_percentile": "docking_score",
             "le_percentile": "leff",
         }
-        for filter_key, filter_value in filters_dict.items():
-            # filter dict contains all possible filters, are None if not specified by user
-            if filter_value is None:
-                continue
-            # if filter has to do with docking energies
-            if filter_key in energy_filter_col_name:
-                if filter_key == "score_percentile" or filter_key == "le_percentile":
-                    # convert from percent to decimal
-                    cutoff = self._calc_percentile_cutoff(
-                        filter_value, energy_filter_col_name[filter_key]
+        # TODO must be a better way to do this
+        # numerical filters
+        docking_score = ["eworst", "ebest"]
+        leff = ["leworst", "lebest"]
+        percentile = ["score_percentile", "le_percentile"]
+
+        # remove None values
+        filters_dict = {k: v for k, v in filters_dict.items() if v is not None}
+
+        # handle docking score filters
+        if any(key in filters_dict for key in docking_score):
+            ds = queryfilters.evaluate_range(filters_dict["ebest", "eworst"])
+            if ds is not None:
+                numerical_filters_NEW.add("docking_score", ds["operator"], ds["value"])
+
+        # handle ligand efficiency filters
+        if any(key in filters_dict for key in leff):
+            le = queryfilters.evaluate_range(filters_dict["lebest", "leworst"])
+            if le is not None:
+                numerical_filters_NEW.add("leff", le["operator"], le["value"])
+
+        # TODO this supercedes the other numerical filter
+        # handle percentile filters
+        if any(key in filters_dict for key in percentile):
+            perc = {k: v for k, v in filters_dict.items() if k in percentile}
+            for filter_key, filter_value in perc.items():
+                # convert from percent to decimal
+                cutoff = self._calc_percentile_cutoff(
+                    filter_value, numfilter_to_column[filter_key]
+                )
+                numerical_filters_NEW.add(numfilter_to_column[filter_key], "=<", cutoff)
+
+        # handle hydrogen bond count
+        if "hb_count" in filters_dict.keys():
+            for k, v in filters_dict["hb_count"]:
+                if k != "hb_count":
+                    self.logger.warning(
+                        f"An unrecognized interaction count filter was found: {k}, which will not be included in the filtering."
                     )
-                    numerical_filters.append(
-                        f"{energy_filter_col_name[filter_key]} < {cutoff}"
+                    continue
+                if v >= 0:
+                    numerical_filters_NEW.append(
+                        {"column": "num_hb", "operator": ">", "value": v}
                     )
                 else:
-                    numerical_filters.append(
-                        self.energy_filter_sqlite_call_dict[filter_key].format(
-                            value=filter_value
-                        )
+                    # if value is negative, it means less than specified number of hydrogen bonds
+                    numerical_filters_NEW.append(
+                        {"column": "num_hb", "operator": "<=", "value": -v}
                     )
-
-            # write hb count filter(s)
-            if filter_key == "hb_count":
-                for k, v in filter_value:
-                    if k != "hb_count":
-                        self.logger.warning(
-                            f"An unrecognized interaction count filter was found: {k}, which will not be included in the filtering."
-                        )
-                        continue
-                    if v > 0:
-                        numerical_filters.append(f"num_hb > {v}")
-                    else:
-                        # if value is negative, it means less than specified number of hydrogen bonds
-                        numerical_filters.append(f"num_hb <= {-v}")
-            interaction_name_to_letter = {
-                "vdw_interactions": "V",
-                "hb_interactions": "H",
-                "reactive_interactions": "R",
+        # handle interaction filters
+        interaction_name_to_letter = {
+            "vdw_interactions": "V",
+            "hb_interactions": "H",
+            "reactive_interactions": "R",
+        }
+        if any(key in filters_dict for key in interaction_name_to_letter.keys()):
+            intrs = {
+                k: v
+                for k, v in filters_dict.items()
+                if k in interaction_name_to_letter.keys()
             }
             # reformat interaction filters as list
-            if filter_key in Filters.get_filter_keys("interaction"):
+            for filter_key, filter_value in intrs:
                 for interact in filter_value:
                     # interact has format ["chain:res:resno:resatom", bool(include or exclude interaction)]
                     interaction_string = (
@@ -2510,9 +2533,11 @@ class StorageManagerSQLite(StorageManager):
                     interaction_filters.append(
                         interaction_string.split(":") + [interact[1]]
                     )
-            # add react_any flag as interaction filter if not None
-            if filter_key == "react_any" and filter_value:
-                interaction_filters.append(["R", "", "", "", "", True])
+        # add react_any flag as interaction filter if not None
+        if "react_any" in filters_dict.keys():
+            interaction_filters.append(["R", "", "", "", "", True])
+
+            # parse ligand filters
 
             # if filter has to do with ligands and SMARTS
             if filter_key in Filters.get_filter_keys("ligand"):
@@ -2540,7 +2565,7 @@ class StorageManagerSQLite(StorageManager):
             processed_filters["lig_filters"] = ligand_filters
         return processed_filters
 
-    def _generate_result_filtering_query(self, filters_dict):
+    def _generate_result_filtering_query(self, filters_dict, cluster_distances: dict):
         """takes lists of filters, writes sql filtering string
 
         Args:
@@ -2589,7 +2614,8 @@ class StorageManagerSQLite(StorageManager):
             )
 
         # check if clustering
-        clustering = bool(self.mfpt_cluster or self.interaction_cluster)
+        clustering = any(v is not None for v in cluster_distances.values())
+
         # if clustering without filtering
         if clustering:
             # allows for clustering without filtering
@@ -2695,7 +2721,9 @@ class StorageManagerSQLite(StorageManager):
         if clustering:
             # if substruct, unclustered query is now mostly pose_ids. If not, it is a full normal query
             try:
-                query = self._prepare_cluster_query(unclustered_query)
+                query = self._prepare_cluster_query(
+                    unclustered_query, cluster_distances
+                )
                 query = " WHERE " + query
             except OptionError as e:
                 raise e
@@ -2950,7 +2978,9 @@ class StorageManagerSQLite(StorageManager):
 
         return filtered_ligands
 
-    def _prepare_cluster_query(self, unclustered_query: str) -> str | None:
+    def _prepare_cluster_query(
+        self, unclustered_query: str, cluster_distances: dict
+    ) -> str | None:
         """
         These methods will take data returned from unclustered filter query, then run the cluster query and cluster the filtered data.
         This will output pose_ids that are representative of the clusters, and these pose_ids will be returned so that
@@ -2962,10 +2992,13 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             str: (reduced) query to include in overall filter query if clustering returned results
         """
-        if self.interaction_cluster and self.mfpt_cluster:
+        if all(v is not None for v in cluster_distances.values()):
             self.logger.warning(
-                "N.B.: If using both interaction and morgan fingerprint clustering, the morgan fingerprint clustering will be performed on the results staus post interaction fingerprint clustering."
+                "N.B.: If using both interaction and morgan fingerprint clustering, the morgan fingerprint clustering will be performed on the results post interaction fingerprint clustering."
             )
+
+        mfpt_cluster_distance = cluster_distances["mfpt_cluster"]
+        interaction_cluster_distance = cluster_distances["interaction_cluster"]
 
         def _clusterFps(fps, cutoff):
             """
@@ -2996,7 +3029,7 @@ class StorageManagerSQLite(StorageManager):
 
         cluster_query_string = None
 
-        if self.interaction_cluster:
+        if interaction_cluster_distance is not None:
             cluster_query = f"SELECT Pose_ID, leff FROM Results WHERE Pose_ID IN ({unclustered_query})"
             # resulting data
             poseid_leffs = self._run_query(cluster_query).fetchall()
@@ -3018,7 +3051,7 @@ class StorageManagerSQLite(StorageManager):
                     DataStructs.CreateFromBitString(poseid_leff_bv[2])
                     for poseid_leff_bv in poseid_leff_bvs
                 ],
-                self.interaction_cluster,
+                interaction_cluster_distance,
             )
             self.logger.info(
                 f"Number of interaction fingerprint butina clusters: {len(bclusters)}"
@@ -3042,7 +3075,7 @@ class StorageManagerSQLite(StorageManager):
                 bclusters,
                 [l[0] for l in poseid_leff_bvs],
                 "ifp",
-                str(self.interaction_cluster),
+                str(interaction_cluster_distance),
             )
 
             # catch if no pose_ids returned
@@ -3055,13 +3088,13 @@ class StorageManagerSQLite(StorageManager):
                     int_rep_poseids
                 )
                 # if more clustering
-                if self.mfpt_cluster is not None:
+                if mfpt_cluster_distance is not None:
                     # carry the pose ids returned by this cluster to the MFPT clustering
                     unclustered_query = (
                         f"SELECT R.Pose_ID FROM Results WHERE {cluster_query_string}"
                     )
 
-        if self.mfpt_cluster:
+        if mfpt_cluster_distance is not None:
             # get relevant data based on all filters specified
             cluster_query = f"SELECT R.Pose_ID, R.leff, L.ligand_rdmol FROM Ligands L INNER JOIN Results R ON R.LigName = L.LigName WHERE R.Pose_ID IN ({unclustered_query})"
             poseid_leff_mfps = self._run_query(cluster_query).fetchall()
@@ -3084,7 +3117,7 @@ class StorageManagerSQLite(StorageManager):
             # run the butina clustering
             bclusters = _clusterFps(
                 mfps,
-                self.mfpt_cluster,
+                mfpt_cluster_distance,
             )
             self.logger.info(
                 f"Number of Morgan fingerprint butina clusters: {len(bclusters)}"
@@ -3100,7 +3133,7 @@ class StorageManagerSQLite(StorageManager):
                 bclusters,
                 [l[0] for l in poseid_leff_mfps],
                 "mfp",
-                str(self.mfpt_cluster),
+                str(mfpt_cluster_distance),
             )
 
             # catch if no pose_ids returned

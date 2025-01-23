@@ -665,8 +665,6 @@ class RingtailCore:
         order_results: str = None,
         outfields: str = None,
         output_all_poses: str = None,
-        mfpt_cluster: float = None,
-        interaction_cluster: float = None,
         bookmark_name: str = None,
         dict: dict = None,
     ):
@@ -723,8 +721,6 @@ class RingtailCore:
             "order_results": order_results,
             "outfields": outfields,
             "output_all_poses": output_all_poses,
-            "mfpt_cluster": mfpt_cluster,
-            "interaction_cluster": interaction_cluster,
             "bookmark_name": bookmark_name,
         }
 
@@ -1364,6 +1360,8 @@ class RingtailCore:
             )
             self.storageopts.output_all_poses = False
 
+        cluster_distances = {"mfpt": mfpt_cluster, "interaction": interaction_cluster}
+
         self.logger.info("Filtering results...")
         ligands_passed = 0
         # get possible permutations of interaction with max_miss excluded
@@ -1376,7 +1374,7 @@ class RingtailCore:
             # pre-process if filtering to multiple bookmark combinations
             if write_one_bookmark:
                 filtered_results = self.storageman.filter_results(
-                    self.filters.todict(),
+                    self.filters.todict(), cluster_distances
                 )
                 # if there were results of the filtering
                 if filtered_results:
@@ -1417,6 +1415,7 @@ class RingtailCore:
                     # ask storageManager to fetch results
                     filtered_results = self.storageman.filter_results(
                         filters_dict,
+                        cluster_distances,
                         not self.outputopts.enumerate_interaction_combs,
                     )
                     if filtered_results:
