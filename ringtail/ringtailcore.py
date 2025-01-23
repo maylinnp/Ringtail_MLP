@@ -606,6 +606,11 @@ class RingtailCore:
             dict=storage_dict,
         )
 
+        # overwrite tables if directed
+        if overwrite:
+            with self.storageman as sm:
+                sm.overwrite_storage(overwrite)
+
         if results_sources.save_receptor:
             self.save_receptor(results_sources.receptor_file)
 
@@ -659,10 +664,7 @@ class RingtailCore:
 
     def set_storageman_attributes(
         self,
-        filter_bookmark: str = None,
         duplicate_handling: str = None,
-        overwrite: bool = None,
-        order_results: str = None,
         outfields: str = None,
         output_all_poses: str = None,
         bookmark_name: str = None,
@@ -672,23 +674,7 @@ class RingtailCore:
         Create storage_manager_options object if needed, sets options, and assigns them to the storage manager object.
 
         Args:
-            filter_bookmark (str): Perform filtering over specified bookmark. (in output group in CLI)
             duplicate_handling (str, options): specify how duplicate Results rows should be handled when inserting into database. Options are "ignore" or "replace". Default behavior will allow duplicate entries.
-            overwrite (bool): by default, if a log file exists, it doesn't get overwritten and an error is returned; this option enable overwriting existing log files. Will also overwrite existing database
-            order_results (str): Stipulates how to order the results when written to the log file. By default will be ordered by order results were added to the database. ONLY TAKES ONE OPTION."
-                    "available fields are:  "
-                    '"e" (docking_score), '
-                    '"le" (ligand efficiency), '
-                    '"delta" (delta energy from best pose), '
-                    '"ref_rmsd" (RMSD to reference pose), '
-                    '"e_inter" (intermolecular energy), '
-                    '"e_vdw" (van der waals energy), '
-                    '"e_elec" (electrostatic energy), '
-                    '"e_intra" (intermolecular energy), '
-                    '"n_interact" (number of interactions), '
-                    '"rank" (rank of ligand pose), '
-                    '"run" (run number for ligand pose), '
-                    '"hb" (hydrogen bonds); '
             outfields (str): defines which fields are used when reporting the results (to stdout and to the log file); fields are specified as comma-separated values, e.g. "--outfields=e,le,hb"; by default, docking_score (energy) and ligand name are reported; ligand always reported in first column available fields are:  '
                     '"Ligand_name" (Ligand name), '
                     '"e" (docking_score), '
@@ -715,10 +701,7 @@ class RingtailCore:
 
         # Dict of individual arguments
         individual_options = {
-            "filter_bookmark": filter_bookmark,
             "duplicate_handling": duplicate_handling,
-            "overwrite": overwrite,
-            "order_results": order_results,
             "outfields": outfields,
             "output_all_poses": output_all_poses,
             "bookmark_name": bookmark_name,
@@ -1325,13 +1308,8 @@ class RingtailCore:
             output_dict = None
         self.set_storageman_attributes(
             output_all_poses=output_all_poses,
-            mfpt_cluster=mfpt_cluster,
-            interaction_cluster=interaction_cluster,
-            overwrite=overwrite,
-            order_results=order_results,
             outfields=outfields,
             bookmark_name=bookmark_name,
-            filter_bookmark=filter_bookmark,
             dict=storage_dict,
         )
         self.set_output_options(
@@ -1374,7 +1352,10 @@ class RingtailCore:
             # pre-process if filtering to multiple bookmark combinations
             if write_one_bookmark:
                 filtered_results = self.storageman.filter_results(
-                    self.filters.todict(), cluster_distances
+                    self.filters.todict(),
+                    cluster_distances,
+                    order_results,
+                    filter_bookmark,
                 )
                 # if there were results of the filtering
                 if filtered_results:
@@ -1416,6 +1397,8 @@ class RingtailCore:
                     filtered_results = self.storageman.filter_results(
                         filters_dict,
                         cluster_distances,
+                        order_results,
+                        filter_bookmark,
                         not self.outputopts.enumerate_interaction_combs,
                     )
                     if filtered_results:

@@ -35,6 +35,7 @@ from .exceptions import (
     DatabaseViewCreationError,
     OptionError,
 )
+from pathlib import Path
 
 
 class StorageManager:
@@ -98,6 +99,7 @@ class StorageManager:
         """
         try:
             self._open_storage()
+            # TODO only invoke overwrite where appropriate, currently no OVERWRITE functionality
         except StorageError as e:
             raise e
         else:
@@ -162,6 +164,19 @@ class StorageManager:
         self._close_connection()
         self.closed_connection = True
 
+    def overwrite_storage(self, consent: bool = False):
+        """
+        _summary_
+
+        Args:
+            consent (bool, optional): _description_. Defaults to False.
+        """
+        if consent:
+            # drop tables
+            self._drop_existing_tables()
+            # create new tables
+            self._create_tables()
+
     # endregion
 
     # region write data
@@ -221,7 +236,12 @@ class StorageManager:
 
     # region read data
     def filter_results(
-        self, all_filters: dict, clustering=False, suppress_output=False
+        self,
+        all_filters: dict,
+        clustering: dict | None,
+        order_results_by: str | None,
+        filtering_window: str | None = None,
+        suppress_output=False,
     ) -> iter:
         """Generate and execute database queries from given filters.
 
@@ -244,7 +264,7 @@ class StorageManager:
             )
         # create view of passing results
         filter_results_str, view_query = self._generate_result_filtering_query(
-            all_filters, clustering
+            all_filters, clustering, order_results_by, filtering_window
         )
         logger.debug(f"Query for filtering results: {filter_results_str}")
 
@@ -459,8 +479,6 @@ class StorageManagerSQLite(StorageManager):
     Attributes:
         conn (SQLite.conn): Connection to database
         db_file (str): database name
-        overwrite (bool): switch to overwrite database if it exists
-        order_results (str): what column name will be used to order results once read
         outfields (str): data fields/columns to include when reading and outputting data
         filter_bookmark (str): name of bookmark that filtering will be performed over
         output_all_poses (bool): whether or not to output all poses of a ligand
@@ -478,8 +496,6 @@ class StorageManagerSQLite(StorageManager):
     def __init__(
         self,
         db_file: str = None,
-        overwrite: bool = None,
-        order_results: str = None,
         outfields: str = None,
         filter_bookmark: str = None,
         output_all_poses: bool = None,
@@ -487,8 +503,6 @@ class StorageManagerSQLite(StorageManager):
         duplicate_handling: str = None,
     ):
         self.db_file = db_file
-        self.overwrite = overwrite
-        self.order_results = order_results
         self.outfields = outfields
         self.output_all_poses = output_all_poses
         self.filter_bookmark = filter_bookmark  # TODO only used in generate filtering query to rename filtering window, optional input
@@ -2560,7 +2574,13 @@ class StorageManagerSQLite(StorageManager):
             processed_filters["lig_filters"] = ligand_filters
         return processed_filters
 
-    def _generate_result_filtering_query(self, filters_dict, cluster_distances: dict):
+    def _generate_result_filtering_query(
+        self,
+        filters_dict,
+        cluster_distances: dict | None = None,
+        order_results_by: str | None = None,
+        filtering_window: str | None = None,
+    ):
         """takes lists of filters, writes sql filtering string
 
         Args:
@@ -2569,9 +2589,6 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             str: SQLite-formatted string for filtering query
         """
-        # table to filter over
-        filtering_window = "Results"
-
         outfield_columns = self._generate_outfield_list()
         num_query = ""
         int_query = ""
@@ -2579,14 +2596,16 @@ class StorageManagerSQLite(StorageManager):
         rdkit_query = False
 
         # if filtering over a bookmark (i.e., already filtered results) as opposed to a whole database
-        if self.filter_bookmark is not None:
-            if self.filter_bookmark == self.bookmark_name:
+        if filtering_window is not None and filtering_window is not "Results":
+            if filtering_window == self.bookmark_name:
                 # cannot write data from bookmark_a to bookmark_a
-                logger.error(
-                    f"Specified 'filter_bookmark' and 'bookmark_name' are the same: {self.bookmark_name}"
-                )
                 raise OptionError(
                     "'filter_bookmark' and 'bookmark_name' cannot be the same! Please rename 'bookmark_name'"
+                )
+            # ensure filtering bookmark exists
+            if filtering_window not in self.get_all_bookmark_names():
+                raise OptionError(
+                    f"'filter_bookmark' {filtering_window} does not exist in this database."
                 )
             # cannot use percentile for an already reduced dataset
             if (
@@ -2594,10 +2613,11 @@ class StorageManagerSQLite(StorageManager):
                 or filters_dict["le_percentile"] is not None
             ):
                 raise OptionError(
-                    "Cannot use 'score_percentile' or 'le_percentile' with 'filter_bookmark'."
+                    "Cannot use 'score_percentile' or 'le_percentile' when filtering over already filtered data in a 'filter_bookmark'."
                 )
-            # filtering window can be specified bookmark, as opposed to entire database using Results table
-            filtering_window = self.filter_bookmark
+        else:
+            # filtering over all results
+            filtering_window = "Results"
 
         # process filter values to lists and dicts that are easily incorporated in sql queries
         processed_filters = self._process_filters_for_query(filters_dict)
@@ -2732,8 +2752,8 @@ class StorageManagerSQLite(StorageManager):
         if not self.output_all_poses:
             query += " GROUP BY R.LigName "
         # add how to order results
-        if self.order_results:
-            query += " ORDER BY " + self.field_to_column_name[self.order_results]
+        if order_results_by:
+            query += " ORDER BY " + self.field_to_column_name[order_results_by]
 
         output_query = query_select_string + query
         view_query = f"SELECT * FROM {filtering_window} R " + query
@@ -3401,17 +3421,17 @@ class StorageManagerSQLite(StorageManager):
             StorageError
         """
         try:
-            # TODO pull in changes from release branch
-            self.conn = self._create_connection()
-            signal(
-                SIGINT, self._sigint_handler
-            )  # signal handler to catch keyboard interupts
-            if self._db_empty() or self.overwrite:  # write and drop tables as necessary
-                if not self._db_empty():
-                    self._drop_existing_tables()
+            # check if file exist
+            db_exist = Path(self.db_file).is_file()
+            # this method will create the db file if it does not already exist
+            self.conn = self._initiate_connection()
+            # signal handler to catch keyboard interupts
+            signal(SIGINT, self._sigint_handler)
+            # create tables if database is new
+            if not db_exist:
+                logger.info("The database file is empty, creating tables.")
                 self._create_tables()
                 self._set_ringtail_db_schema_version(self._db_schema_ver)
-
             logger.info(f"Ringtail connected to database {self.db_file}.")
         except Exception as e:
             raise StorageError(f"Errow while creating or connecting to database: {e}.")
@@ -3988,8 +4008,8 @@ class StorageManagerSQLite(StorageManager):
         # delete all rows in bookmarks table
         cur.execute(f"DELETE FROM {alias_string}Bookmarks")
 
-    def _create_connection(self):
-        """Creates database connection to self.db_file
+    def _initiate_connection(self) -> sqlite3.Connection:
+        """Initiates database connection to self.db_file
 
         Returns:
             SQLite.conn: Connection object to self.db_file
@@ -3998,16 +4018,16 @@ class StorageManagerSQLite(StorageManager):
             DatabaseConnectionError
         """
         try:
-            con = sqlite3.connect(self.db_file)
-            cursor = con.execute("PRAGMA synchronous = OFF;")
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute("PRAGMA synchronous = OFF;")
             cursor.execute("PRAGMA journal_mode = MEMORY;")
-            con.commit()
+            conn.commit()
             cursor.close()
         except sqlite3.OperationalError as e:
             raise DatabaseConnectionError(
                 "Error while establishing database connection"
             ) from e
-        return con
+        return conn
 
     def _close_connection(self):
         """Closes connection to database"""
