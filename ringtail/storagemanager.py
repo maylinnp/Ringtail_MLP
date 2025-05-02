@@ -238,8 +238,7 @@ class StorageManager:
     def filter_results(
         self,
         all_filters: dict,
-        clustering: dict | None,
-        order_results_by: str | None,
+        output_options: dict | None,
         filtering_window: str | None = None,
         suppress_output=False,
     ) -> iter:
@@ -269,14 +268,10 @@ class StorageManager:
         logger.debug(f"Query for filtering results: {filter_results_str}")
 
         # if max_miss> and we are enumerating interaction combinations, we want to give each passing view a new name by changing the self.bookmark_name
-        if self.view_suffix is not None:
-            self.current_bookmark_name = self.bookmark_name + "_" + self.view_suffix
-        else:
-            self.current_bookmark_name = self.bookmark_name
 
         # make sure we keep Pose_ID in view
         self.create_bookmark(
-            name=self.current_bookmark_name, query=view_query, filters=all_filters
+            name=self.bookmark_name, query=view_query, filters=all_filters
         )
 
         # perform filtering
@@ -479,16 +474,9 @@ class StorageManagerSQLite(StorageManager):
     Attributes:
         conn (SQLite.conn): Connection to database
         db_file (str): database name
-        outfields (str): data fields/columns to include when reading and outputting data
-        filter_bookmark (str): name of bookmark that filtering will be performed over
-        output_all_poses (bool): whether or not to output all poses of a ligand
         bookmark_name (str): name of current bookmark being written to or read from
         duplicate_handling (str): optional attribute to deal with insertion of ligands already in the database
-
-        current_bookmark_name (str): name of last view to have been written to in the database
         filtering_window (str): name of bookmark/view being filtered on
-        index_columns (list)
-        view_suffix (int): current suffix for views
         temptable_suffix (int): current suffix for temporary tables
         field_to_column_name (dict): Dictionary for converting ringtail options into DB column names
     """
@@ -496,21 +484,14 @@ class StorageManagerSQLite(StorageManager):
     def __init__(
         self,
         db_file: str = None,
-        outfields: str = None,
-        filter_bookmark: str = None,
-        output_all_poses: bool = None,
         bookmark_name: str = None,
         duplicate_handling: str = None,
     ):
         self.db_file = db_file
-        self.outfields = outfields
-        self.output_all_poses = output_all_poses
-        self.filter_bookmark = filter_bookmark  # TODO only used in generate filtering query to rename filtering window, optional input
         self.bookmark_name = bookmark_name
         self.duplicate_handling = duplicate_handling  # TODO only in two methods: insert results and insert interaction row, does not have to be class varialble
         super().__init__()
 
-        self.view_suffix = None  # TODO should be depreceated
         self.temptable_suffix = 0  # TODO should be depreceated
 
     # region Methods for inserting into/removing from the database
@@ -1645,17 +1626,6 @@ class StorageManagerSQLite(StorageManager):
 
         return bookmark_names
 
-    def set_bookmark_suffix(self, suffix):
-        """Sets internal bookmark_suffix variable
-
-        Args:
-            suffix (str): suffix to attached to bookmark-related queries or creation
-        """
-        if not isinstance(suffix, str):
-            self.view_suffix = str(suffix)
-        else:
-            self.view_suffix = suffix
-
     def fetch_filters_from_bookmark(self, bookmark_name: str | None = None):
         """Method that will retrieve filter values used to construct bookmark
 
@@ -1696,7 +1666,7 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             str: name of last passing results bookmark used by database
         """
-        return self.current_bookmark_name
+        return self.bookmark_name
 
     def fetch_bookmark(self, bookmark_name: str) -> sqlite3.Cursor:
         """returns SQLite cursor of all fields in bookmark
@@ -1835,7 +1805,7 @@ class StorageManagerSQLite(StorageManager):
         wanted_list,
         unwanted_list=[],
     ):
-        """Resaves temp bookmark stored in self.current_bookmark_name as new permenant bookmark
+        """Resaves temp bookmark stored in self.bookmark_name as new permenant bookmark
 
         Args:
             bookmark_name (str): name of bookmark to save last temp bookmark as
@@ -1941,7 +1911,7 @@ class StorageManagerSQLite(StorageManager):
         Raises:
             OptionError
         """
-        output_fields = self.outfields
+        output_fields = self.outfields  # TODO
         if type(output_fields) == str:
             output_fields = output_fields.replace(" ", "")
             output_fields_list = output_fields.split(",")
@@ -2256,7 +2226,7 @@ class StorageManagerSQLite(StorageManager):
             DatabaseQueryError
         """
         if bookmark_name is None:
-            bookmark_name = self.current_bookmark_name
+            bookmark_name = self.bookmark_name
         try:
             cur = self.conn.cursor()
             cur.execute(f"SELECT COUNT(DISTINCT LigName) FROM {bookmark_name}")
@@ -2279,7 +2249,7 @@ class StorageManagerSQLite(StorageManager):
         """
         selection_strs = []
         view_strs = []
-        outfield_list = self._generate_outfield_list()
+        outfield_list = self._generate_outfield_list()  # TODO
         for i in range(total_combinations):
             selection_strs.append(
                 f"""SELECT {", ".join(outfield_list)} FROM {self.bookmark_name + '_' + str(i)}"""
@@ -2290,7 +2260,9 @@ class StorageManagerSQLite(StorageManager):
         logger.debug("Saving union bookmark...")
         union_view_query = " UNION ".join(view_strs)
         union_select_query = " UNION ".join(selection_strs)
-        if not self.output_all_poses:
+        if (
+            not self.output_all_poses
+        ):  # TODO probably need to write the full query elsewhere, and don't write any sql in here except the strict query
             # if not outputting all poses, it is necessary to "create" the view (each of which had a grouping statement), then group by in the final view
             union_view_query = (
                 "SELECT * FROM (" + union_view_query + ") GROUP BY LigName"
@@ -2418,7 +2390,7 @@ class StorageManagerSQLite(StorageManager):
         except sqlite3.OperationalError as e:
             raise StorageError("Error while generating percentile query") from e
 
-    def _generate_outfield_list(self):
+    def _generate_outfield_list(self, outfields: str) -> list:
         """list describing outfields to be written
 
         Returns:
@@ -2427,6 +2399,7 @@ class StorageManagerSQLite(StorageManager):
         Raises:
             OptionError
         """
+        # TODO
         # parse requested output fields and convert to column names in database
         outfields_list = self.outfields.split(",")
         for outfield in outfields_list:
@@ -2579,6 +2552,8 @@ class StorageManagerSQLite(StorageManager):
         filters_dict,
         cluster_distances: dict | None = None,
         order_results_by: str | None = None,
+        outfields: str | None = None,
+        output_all_poses: bool | None = None,
         filtering_window: str | None = None,
     ):
         """takes lists of filters, writes sql filtering string
@@ -2589,7 +2564,7 @@ class StorageManagerSQLite(StorageManager):
         Returns:
             str: SQLite-formatted string for filtering query
         """
-        outfield_columns = self._generate_outfield_list()
+        outfield_columns = self._generate_outfield_list(outfields)
         num_query = ""
         int_query = ""
         ligname_query = ""
@@ -2615,8 +2590,8 @@ class StorageManagerSQLite(StorageManager):
                 raise OptionError(
                     "Cannot use 'score_percentile' or 'le_percentile' when filtering over already filtered data in a 'filter_bookmark'."
                 )
+        # filtering over all results
         else:
-            # filtering over all results
             filtering_window = "Results"
 
         # process filter values to lists and dicts that are easily incorporated in sql queries
@@ -2749,7 +2724,7 @@ class StorageManagerSQLite(StorageManager):
         # choose columns to be selected from filtering_window
         query_select_string = f"""SELECT {", ".join("R." + column for column in outfield_columns)} FROM {filtering_window} R """
         # adding if we only want to keep one pose per ligand (will keep first entry)
-        if not self.output_all_poses:
+        if not output_all_poses:
             query += " GROUP BY R.LigName "
         # add how to order results
         if order_results_by:

@@ -617,7 +617,9 @@ class RingtailCore:
         with self.storageman:
             # Prepare the results manager with the provided docking results sources
             if strings == False:
-                self._create_resultsmanager(file_sources=results_sources)
+                self._create_resultsmanager(
+                    file_sources=results_sources
+                )  # TODO this is where duplicate handling should enter
             elif strings == True:
                 self._create_resultsmanager(string_sources=results_sources)
             self.resultsman.storageman = self.storageman
@@ -666,7 +668,6 @@ class RingtailCore:
         self,
         duplicate_handling: str = None,
         outfields: str = None,
-        output_all_poses: str = None,
         bookmark_name: str = None,
         dict: dict = None,
     ):
@@ -692,7 +693,6 @@ class RingtailCore:
                     '"hb" (hydrogen bonds), '
                     '"receptor" (receptor name); '
                     "Fields are printed in the order in which they are provided. Ligand name will always be returned and will be added in first position if not specified.
-            output_all_poses (bool): By default, will output only top-scoring pose passing filters per ligand. This flag will cause each pose passing the filters to be logged.
             mfpt_cluster (float): Cluster filered ligands by Tanimoto distance of Morgan fingerprints with Butina clustering and output ligand with lowest ligand efficiency from each cluster. Default clustering cutoff is 0.5. Useful for selecting chemically dissimilar ligands.
             interaction_cluster (float): Cluster filered ligands by Tanimoto distance of interaction fingerprints with Butina clustering and output ligand with lowest ligand efficiency from each cluster. Default clustering cutoff is 0.5. Useful for enhancing selection of ligands with diverse interactions.
             bookmark_name (str): name for resulting book mark file. Default value is "passing_results"
@@ -703,7 +703,6 @@ class RingtailCore:
         individual_options = {
             "duplicate_handling": duplicate_handling,
             "outfields": outfields,
-            "output_all_poses": output_all_poses,
             "bookmark_name": bookmark_name,
         }
 
@@ -1307,7 +1306,6 @@ class RingtailCore:
             storage_dict = None
             output_dict = None
         self.set_storageman_attributes(
-            output_all_poses=output_all_poses,
             outfields=outfields,
             bookmark_name=bookmark_name,
             dict=storage_dict,
@@ -1330,16 +1328,23 @@ class RingtailCore:
             self.outputopts.enumerate_interaction_combs = True
 
         # guard against unsing percentile filter with all_poses
-        if self.storageopts.output_all_poses and not (
+        if output_all_poses and not (
             self.filters.score_percentile is None or self.filters.le_percentile is None
         ):
             self.logger.warning(
                 "Cannot return all passing poses with percentile filter. Will only log best pose."
             )
-            self.storageopts.output_all_poses = False
+            output_all_poses = False
 
-        cluster_distances = {"mfpt": mfpt_cluster, "interaction": interaction_cluster}
-
+        output_options = {
+            "order_results": order_results,
+            "output_all_poses": output_all_poses,
+            "outfields": outfields,
+            "cluster_distances": {
+                "mfpt": mfpt_cluster,
+                "interaction": interaction_cluster,
+            },
+        }
         self.logger.info("Filtering results...")
         ligands_passed = 0
         # get possible permutations of interaction with max_miss excluded
@@ -1353,8 +1358,7 @@ class RingtailCore:
             if write_one_bookmark:
                 filtered_results = self.storageman.filter_results(
                     self.filters.todict(),
-                    cluster_distances,
-                    order_results,
+                    output_options,
                     filter_bookmark,
                 )
                 # if there were results of the filtering
@@ -1383,21 +1387,26 @@ class RingtailCore:
                     self.logger.warning(f"WARNING: No ligands found passing filter.")
                     self.storageman.drop_bookmark(self.storageman.bookmark_name)
             # else produce a bookmark for each interaction combination
-            elif not write_one_bookmark:
+            else:
                 interaction_combs = self._generate_interaction_combinations(
                     self.filters.max_miss
                 )
+                if len(interaction_combs) > 1:
+                    bookmark_name_base = self.storageman.bookmark_name
+
                 for ic_idx, combination in enumerate(interaction_combs):
                     # prepare Filter object with only desired interaction combination for storageManager
                     filters_dict = self._prepare_filters_for_storageman(combination)
                     # set storageMan's internal ic_counter to reflect current ic_idx
                     if len(interaction_combs) > 1:
-                        self.storageman.set_bookmark_suffix(ic_idx)
+                        # change bookmark name
+                        self.storageman.bookmark_name = (
+                            bookmark_name_base + "_" + str(ic_idx)
+                        )
                     # ask storageManager to fetch results
                     filtered_results = self.storageman.filter_results(
                         filters_dict,
-                        cluster_distances,
-                        order_results,
+                        output_options,
                         filter_bookmark,
                         not self.outputopts.enumerate_interaction_combs,
                     )
@@ -1429,6 +1438,8 @@ class RingtailCore:
                             f"WARNING: No ligands found passing given interaction combination {combination}"
                         )
                         self.storageman.drop_bookmark(self.storageman.bookmark_name)
+                self.storageman.bookmark_name = bookmark_name_base
+
                 if len(interaction_combs) > 1:
                     maxmiss_union_results = self.storageman.get_maxmiss_union(
                         len(interaction_combs)
